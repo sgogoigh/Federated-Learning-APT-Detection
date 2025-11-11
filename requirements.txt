@@ -1,0 +1,26 @@
+# Core Python and data handling
+pandas==2.2.3
+numpy==1.26.4
+scikit-learn==1.5.2
+
+# PyTorch (core + CUDA)
+torchvision==0.19.1
+torchaudio==2.4.1
+
+# PyTorch Geometric (Graph Neural Network library)
+torch-geometric==2.5.3
+torch-scatter==2.1.2
+torch-sparse==0.6.18
+torch-cluster==1.6.3
+torch-spline-conv==1.2.2
+
+# Graph building and analysis
+networkx==3.3
+
+# Visualization & metrics
+matplotlib==3.9.2
+seaborn==0.13.2
+
+# Utility / environment
+tqdm==4.66.5
+joblib==1.4.2
