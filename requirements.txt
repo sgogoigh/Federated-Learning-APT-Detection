@@ -23,3 +23,9 @@ seaborn==0.13.2
 # Utility / environment
 tqdm==4.66.5
 joblib==1.4.2
+
+# Additional downloads
+# pip install torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.4.1+cpu.html
+
+# Kaggle
+kagglehub
