@@ -42,6 +42,7 @@ runs/
 logs/
 outputs/
 checkpoints/
+train-logs.txt
 
 # ── IDE & editor files ────────────────────────────────────────────────────────
 .vscode/

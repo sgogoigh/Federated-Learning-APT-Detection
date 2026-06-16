@@ -16,8 +16,24 @@ Usage:
 """
 
 import os
+import sys
 import argparse
 import json
+
+class Logger(object):
+    def __init__(self, filename="train-logs.txt"):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+sys.stdout = Logger()
 import random
 import copy
 import pickle
@@ -404,11 +420,15 @@ def main(args):
     # ------------------------------------------------------------------
     # 1. Load dataset
     # ------------------------------------------------------------------
-    dataset_path = os.environ.get("DATASET_PATH", "data")
+    dataset_path = os.environ.get("DATASET_PATH", "data").strip('"').strip("'")
     csv_path = os.path.join(dataset_path, args.csv)
     if not os.path.isfile(csv_path):
         # Try as an absolute / relative path directly
         csv_path = args.csv
+
+    # Temporary hardcoding
+    csv_path = r"C:\Users\sgogo\OneDrive\Desktop\APT Detection Fed Learning\datasets\mrwellsdavid\unsw-nb15\versions\1\UNSW_NB15_training-set.csv"
+
     print(f"\n{'='*60}")
     print(f"Loading dataset from: {csv_path}")
     df = pd.read_csv(csv_path, low_memory=False)
@@ -559,6 +579,7 @@ def main(args):
         # ---- Per-class classification report  (EVAL-03) ----
         report = classification_report(
             g_yt, g_yp,
+            labels=list(range(num_classes)),
             target_names=attack_enc.classes_,
             zero_division=0,
         )

@@ -145,7 +145,7 @@ for i, kind in enumerate(synthetic_kinds, 1):
 print("--- Running prediction on a real dataset sample ---\n")
 from dotenv import load_dotenv
 load_dotenv()
-dataset_path = os.environ.get("DATASET_PATH", "data")
+dataset_path = os.environ.get("DATASET_PATH", "data").strip('"').strip("'")
 csv_file = os.path.join(dataset_path, "UNSW_NB15_training-set.csv")
 
 if os.path.exists(csv_file):

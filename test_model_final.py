@@ -119,7 +119,7 @@ for step in mitigation.get(attack_type, ["No data."]):
 print("\n--- Testing model on a real sample from dataset ---")
 from dotenv import load_dotenv
 load_dotenv()
-dataset_path = os.environ.get("DATASET_PATH", "data")
+dataset_path = os.environ.get("DATASET_PATH", "data").strip('"').strip("'")
 csv_file = os.path.join(dataset_path, "UNSW_NB15_training-set.csv")
 
 if os.path.exists(csv_file):
