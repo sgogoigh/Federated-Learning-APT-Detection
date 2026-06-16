@@ -118,9 +118,13 @@ IN_DIM = 14
 # Model
 # ---------------------------------------------------------------------------
 class GraphSAGEClassifier(nn.Module):
-    """Two-layer GraphSAGE with global mean pooling for graph classification."""
-    def __init__(self, in_dim, hidden_dim, num_classes, dropout=0.3):
+    """Two-layer GraphSAGE with embeddings for categorical features and continuous features."""
+    def __init__(self, num_protos, num_services, continuous_dim, hidden_dim, num_classes, dropout=0.3):
         super().__init__()
+        self.proto_emb = nn.Embedding(num_protos, 16)
+        self.service_emb = nn.Embedding(num_services, 8)
+        
+        in_dim = continuous_dim + 16 + 8
         self.conv1 = SAGEConv(in_dim, hidden_dim)
         self.conv2 = SAGEConv(hidden_dim, hidden_dim)
         self.fc = nn.Linear(hidden_dim, num_classes)
@@ -129,16 +133,26 @@ class GraphSAGEClassifier(nn.Module):
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
-        x = self.relu(self.conv1(x, edge_index))
+        cont_feats = x[:, :12]
+        proto_idx = x[:, 12].long()
+        service_idx = x[:, 13].long()
+        
+        p_emb = self.proto_emb(proto_idx)
+        s_emb = self.service_emb(service_idx)
+        
+        x_emb = torch.cat([cont_feats, p_emb, s_emb], dim=1)
+        
+        x = self.relu(self.conv1(x_emb, edge_index))
         x = self.dropout(x)
         x = self.relu(self.conv2(x, edge_index))
         return self.fc(self.dropout(x))
+
 
 # ---------------------------------------------------------------------------
 # Preprocessing
 # ---------------------------------------------------------------------------
 def preprocess_df(df):
-    """Clean, encode, and scale the DataFrame. Returns (df, LabelEncoder)."""
+    """Clean, encode, and scale the DataFrame. Returns (df, LabelEncoder, LabelEncoder, LabelEncoder)."""
     df.columns = [c.strip().lower() for c in df.columns]  # normalise to lowercase
 
     # Normalise label naming: Backdoors → Backdoor
@@ -161,11 +175,16 @@ def preprocess_df(df):
         # derive from attack_cat if absent
         df["label"] = (df["attack_cat"] != "Normal").astype(int)
 
-    # Encode protocol and service
+    # Encode protocol and service safely (include "<unknown>" class)
     le_proto = LabelEncoder()
-    df["proto_enc"] = le_proto.fit_transform(df[CAT_PROTO].astype(str))
+    unique_protos = df[CAT_PROTO].astype(str).unique()
+    le_proto.fit(np.append(unique_protos, "<unknown>"))
+    df["proto_enc"] = le_proto.transform(df[CAT_PROTO].astype(str))
+
     le_service = LabelEncoder()
-    df["service_enc"] = le_service.fit_transform(df[CAT_SERVICE].astype(str))
+    unique_services = df[CAT_SERVICE].astype(str).unique()
+    le_service.fit(np.append(unique_services, "<unknown>"))
+    df["service_enc"] = le_service.transform(df[CAT_SERVICE].astype(str))
 
     # Ensure numeric columns are numeric
     for c in NUMERIC_FEATURE_COLS:
@@ -182,78 +201,82 @@ def preprocess_df(df):
     le_attack = LabelEncoder()
     df["attack_label"] = le_attack.fit_transform(df["attack_cat"])
 
-    return df, le_attack
+    return df, le_attack, le_proto, le_service
 
 # ---------------------------------------------------------------------------
 # Graph construction
 # ---------------------------------------------------------------------------
 def build_graphs(df, max_nodes=120):
-    """Build PyG Data graphs by grouping flows on (service_enc, proto_enc)."""
+    """Build PyG Data graphs by chunking chronologically and connecting using KNN."""
     graphs = []
 
-    # Group by service (we dropped hour_of_day since it's unavailable in the
-    # official CSV — group by service_enc alone to still create varied subgraphs)
-    for service_val, grp in df.groupby("service_enc"):
-        grp = grp.reset_index(drop=True)
-        for i in range(0, len(grp), max_nodes):
-            sub = grp.iloc[i : i + max_nodes]
-            if len(sub) < 2:
-                continue  # skip trivial graphs
+    # Chunk the sorted dataframe chronologically
+    for i in range(0, len(df), max_nodes):
+        sub = df.iloc[i : i + max_nodes]
+        if len(sub) < 2:
+            continue  # skip trivial graphs
 
-            G = nx.Graph()
-            for idx, row in sub.iterrows():
-                feats = np.concatenate([
-                    row[NUMERIC_FEATURE_COLS].to_numpy(),
-                    [row["proto_enc"], row["service_enc"]],
-                ]).astype(np.float32)
-                G.add_node(
-                    idx,
-                    x=feats,
-                    y=row["attack_label"],
-                    label=row["label"],
-                    attack=row["attack_cat"],
-                )
-
-            # Edges: connect nodes that share proto_enc OR service_enc OR
-            # have very similar scaled feature values on the first two numeric cols
-            nodes = list(G.nodes)
-            for a in range(len(nodes)):
-                for b in range(a + 1, len(nodes)):
-                    ra = G.nodes[nodes[a]]
-                    rb = G.nodes[nodes[b]]
-                    if (
-                        ra["x"][-2] == rb["x"][-2]  # same proto_enc
-                        or ra["x"][-1] == rb["x"][-1]  # same service_enc
-                        or abs(ra["x"][0] - rb["x"][0]) < 1e-3  # similar dur
-                        or abs(ra["x"][1] - rb["x"][1]) < 1e-3  # similar sbytes
-                    ):
-                        G.add_edge(nodes[a], nodes[b])
-
-            # Manual PyG conversion
-            x = np.array([G.nodes[n]["x"] for n in G.nodes], dtype=np.float32)
-            x = torch.from_numpy(x)
-
-            edges = np.array(list(G.edges), dtype=np.int64)
-            if edges.size == 0:
-                edge_index = torch.empty((2, 0), dtype=torch.long)
-            else:
-                max_idx = x.size(0)
-                edges = edges[(edges[:, 0] < max_idx) & (edges[:, 1] < max_idx)]
-                edge_index = torch.from_numpy(edges.T)
-
-            # Node-level label
-            y = torch.tensor([G.nodes[n]["y"] for n in G.nodes], dtype=torch.long)
-            binary = torch.tensor(
-                [1 if any(G.nodes[n]["label"] for n in G.nodes) else 0],
-                dtype=torch.long,
+        G = nx.Graph()
+        # Add nodes with local indices 0, 1, ..., len(sub)-1
+        for local_idx, (orig_idx, row) in enumerate(sub.iterrows()):
+            feats = np.concatenate([
+                row[NUMERIC_FEATURE_COLS].to_numpy(),
+                [row["proto_enc"], row["service_enc"]],
+            ]).astype(np.float32)
+            G.add_node(
+                local_idx,
+                x=feats,
+                y=row["attack_label"],
+                label=row["label"],
+                attack=row["attack_cat"],
             )
-            batch = torch.zeros(x.size(0), dtype=torch.long)
-            data_obj = Data(x=x, edge_index=edge_index, y=y, binary=binary, batch=batch)
 
-            if edge_index.numel() > 0 and edge_index.max() >= x.size(0):
-                print(f"  [warn] Invalid edge index in service={service_val}")
+        nodes = list(G.nodes)
+        num_nodes = len(nodes)
 
-            graphs.append(data_obj)
+        # Build KNN edges on the 12 scaled continuous features
+        feats_numeric = np.array([G.nodes[n]["x"][:12] for n in G.nodes])
+        dist = np.linalg.norm(feats_numeric[:, None, :] - feats_numeric[None, :, :], axis=-1)
+
+        k = 3
+        if num_nodes <= k + 1:
+            # Connect everyone if the graph is too small
+            for a in range(num_nodes):
+                for b in range(a + 1, num_nodes):
+                    G.add_edge(nodes[a], nodes[b])
+        else:
+            for a in range(num_nodes):
+                # Argsort to find nearest neighbors
+                nearest = np.argsort(dist[a])
+                added = 0
+                for neighbor in nearest:
+                    if neighbor == a:
+                        continue
+                    G.add_edge(nodes[a], nodes[neighbor])
+                    added += 1
+                    if added >= k:
+                        break
+
+        # PyG conversion
+        x = np.array([G.nodes[n]["x"] for n in G.nodes], dtype=np.float32)
+        x = torch.from_numpy(x)
+
+        edges = np.array(list(G.edges), dtype=np.int64)
+        if edges.size == 0:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+        else:
+            edge_index = torch.from_numpy(edges.T)
+
+        # Node-level labels
+        y = torch.tensor([G.nodes[n]["y"] for n in G.nodes], dtype=torch.long)
+        binary = torch.tensor(
+            [1 if any(G.nodes[n]["label"] for n in G.nodes) else 0],
+            dtype=torch.long,
+        )
+        batch = torch.zeros(x.size(0), dtype=torch.long)
+        data_obj = Data(x=x, edge_index=edge_index, y=y, binary=binary, batch=batch)
+
+        graphs.append(data_obj)
 
     return graphs
 
@@ -321,8 +344,13 @@ def train_local(graphs, global_state, num_classes, config, name):
     split2 = int(0.85 * len(shuffled))
     train_data, val_data, test_data = shuffled[:split1], shuffled[split1:split2], shuffled[split2:]
 
-    in_dim = graphs[0].x.shape[1]
-    model = GraphSAGEClassifier(in_dim, config["hidden_dim"], num_classes).to(DEVICE)
+    model = GraphSAGEClassifier(
+        num_protos=config["num_protos"],
+        num_services=config["num_services"],
+        continuous_dim=12,
+        hidden_dim=config["hidden_dim"],
+        num_classes=num_classes,
+    ).to(DEVICE)
     if global_state:
         model.load_state_dict(global_state, strict=False)
 
@@ -438,7 +466,9 @@ def main(args):
     # 2. Preprocess
     # ------------------------------------------------------------------
     print("Preprocessing...")
-    df, attack_enc = preprocess_df(df)
+    df, attack_enc, le_proto, le_service = preprocess_df(df)
+    num_protos = len(le_proto.classes_)
+    num_services = len(le_service.classes_)
     num_classes = len(attack_enc.classes_)
     print(f"  Classes ({num_classes}): {list(attack_enc.classes_)}")
     print(f"  Class distribution:")
@@ -479,6 +509,8 @@ def main(args):
         "lr": 1e-3,
         "wd": 1e-4,
         "hidden_dim": args.hidden_dim,
+        "num_protos": num_protos,
+        "num_services": num_services,
     }
 
     global_state = None
@@ -540,6 +572,25 @@ def main(args):
         pickle.dump(attack_enc, f)
     print("Saved results/attack_encoder.pkl")
 
+    with open("results/proto_encoder.pkl", "wb") as f:
+        pickle.dump(le_proto, f)
+    print("Saved results/proto_encoder.pkl")
+
+    with open("results/service_encoder.pkl", "wb") as f:
+        pickle.dump(le_service, f)
+    print("Saved results/service_encoder.pkl")
+
+    model_config = {
+        "num_protos": num_protos,
+        "num_services": num_services,
+        "continuous_dim": 12,
+        "hidden_dim": args.hidden_dim,
+        "num_classes": num_classes,
+    }
+    with open("results/model_config.json", "w") as f:
+        json.dump(model_config, f, indent=2)
+    print("Saved results/model_config.json")
+
     # ------------------------------------------------------------------
     # 9. Global test set evaluation  (EVAL-02)
     # ------------------------------------------------------------------
@@ -549,7 +600,11 @@ def main(args):
         print(f"{'='*60}")
 
         global_net = GraphSAGEClassifier(
-            IN_DIM, config["hidden_dim"], num_classes
+            num_protos=config["num_protos"],
+            num_services=config["num_services"],
+            continuous_dim=12,
+            hidden_dim=config["hidden_dim"],
+            num_classes=num_classes,
         ).to(DEVICE)
         global_net.load_state_dict(global_state, strict=False)
         global_net.eval()

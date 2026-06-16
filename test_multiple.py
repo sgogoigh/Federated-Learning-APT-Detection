@@ -7,6 +7,7 @@ Uses the saved model (full state_dict) and saved encoder.
 
 import os
 import pickle
+import json
 
 import torch
 import numpy as np
@@ -26,10 +27,41 @@ NUMERIC_FEATURE_COLS = [
 ]
 IN_DIM = 14
 
+# --- Load model config ---
+config_path = "results/model_config.json"
+if os.path.exists(config_path):
+    with open(config_path, "r") as f:
+        model_config = json.load(f)
+else:
+    model_config = {
+        "num_protos": 134,
+        "num_services": 14,
+        "num_classes": 10,
+        "hidden_dim": 64
+    }
+
+# --- Load saved encoders ---
+with open("results/proto_encoder.pkl", "rb") as f:
+    le_proto = pickle.load(f)
+with open("results/service_encoder.pkl", "rb") as f:
+    le_service = pickle.load(f)
+
+def safe_encode(le, series, unseen_val="<unknown>"):
+    classes = set(le.classes_)
+    if unseen_val not in classes:
+        le.classes_ = np.append(le.classes_, unseen_val)
+        classes.add(unseen_val)
+    series_clean = series.map(lambda x: x if x in classes else unseen_val)
+    return le.transform(series_clean)
+
 # --- Model Definition ---
 class GraphSAGEClassifier(torch.nn.Module):
-    def __init__(self, in_dim, hidden_dim, num_classes, dropout=0.3):
+    def __init__(self, num_protos, num_services, continuous_dim, hidden_dim, num_classes, dropout=0.3):
         super().__init__()
+        self.proto_emb = torch.nn.Embedding(num_protos, 16)
+        self.service_emb = torch.nn.Embedding(num_services, 8)
+        
+        in_dim = continuous_dim + 16 + 8
         self.conv1 = SAGEConv(in_dim, hidden_dim)
         self.conv2 = SAGEConv(hidden_dim, hidden_dim)
         self.fc = torch.nn.Linear(hidden_dim, num_classes)
@@ -38,7 +70,16 @@ class GraphSAGEClassifier(torch.nn.Module):
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
-        x = self.relu(self.conv1(x, edge_index))
+        cont_feats = x[:, :12]
+        proto_idx = x[:, 12].long()
+        service_idx = x[:, 13].long()
+        
+        p_emb = self.proto_emb(proto_idx)
+        s_emb = self.service_emb(service_idx)
+        
+        x_emb = torch.cat([cont_feats, p_emb, s_emb], dim=1)
+        
+        x = self.relu(self.conv1(x_emb, edge_index))
         x = self.dropout(x)
         x = self.relu(self.conv2(x, edge_index))
         return self.fc(self.dropout(x))
@@ -71,7 +112,13 @@ if not os.path.exists(model_path):
     raise FileNotFoundError("Model file not found. Please train first at results/global_model.pt")
 
 print("Loading trained model weights...")
-net = GraphSAGEClassifier(IN_DIM, 64, num_classes).to(DEVICE)
+net = GraphSAGEClassifier(
+    num_protos=model_config["num_protos"],
+    num_services=model_config["num_services"],
+    continuous_dim=12,
+    hidden_dim=model_config["hidden_dim"],
+    num_classes=num_classes
+).to(DEVICE)
 state_dict = torch.load(model_path, map_location=DEVICE, weights_only=True)
 # BUG-03 FIX: Load the COMPLETE model — do NOT filter out fc. layer
 net.load_state_dict(state_dict, strict=False)
@@ -98,8 +145,8 @@ rng = np.random.RandomState(42)
 def make_synthetic_case(kind="generic"):
     """Generate a synthetic 14-dim feature vector simulating different attack types."""
     base = rng.normal(loc=0.0, scale=0.5, size=12).astype(np.float32)
-    proto_enc = float(rng.randint(0, 10))
-    service_enc = float(rng.randint(0, 10))
+    proto_enc = float(rng.randint(0, model_config["num_protos"]))
+    service_enc = float(rng.randint(0, model_config["num_services"]))
 
     if kind == "exploit":
         base[1], base[2] = 3.0, 2.5   # high sbytes/dbytes
@@ -153,8 +200,8 @@ if os.path.exists(csv_file):
     df["attack_cat"] = df["attack_cat"].astype(str).str.strip().replace("", "Normal").fillna("Normal")
 
     # Encode
-    df["proto_enc"] = LabelEncoder().fit_transform(df["proto"].astype(str))
-    df["service_enc"] = LabelEncoder().fit_transform(df["service"].astype(str))
+    df["proto_enc"] = safe_encode(le_proto, df["proto"].astype(str))
+    df["service_enc"] = safe_encode(le_service, df["service"].astype(str))
 
     # Scale numeric
     for c in NUMERIC_FEATURE_COLS:

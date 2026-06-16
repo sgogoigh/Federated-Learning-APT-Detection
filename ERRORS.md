@@ -49,3 +49,22 @@ This document serves as a catalogue of the architectural, programmatic, and pipe
 ### PROBLEM NO.8: Exploding Loss Gradients due to Missing Classes
 **Description:** The `train_local` script calculated inverse-frequency class weights using the formula `1.0 / (count + 1e-6)`. If a local client partition happened to be missing an attack class entirely (count = 0), the loss penalty weight for that class skyrocketed to `1,000,000`, destabilizing gradients and halting convergence.
 **FIX 8:** Implemented a mathematically stable balanced weighting formula (`total_samples / (num_classes * class_count)`). If a class is completely absent, its weight is gracefully set to `0.0`.
+
+---
+
+### PROBLEM NO.9: Graph Over-smoothing via Cliques
+**Description:** The training pipeline grouped flows by `service_enc` and connected flows sharing `service_enc`. Since all flows in a sliced subgraph shared the same service, every subgraph became a fully connected clique. Mean neighborhood aggregation in a clique averages all node features, erasing individual flow details and causing the model to collapse to predicting only the majority class.
+**FIX 9:** Chunked the dataset chronologically (retaining protocol/service diversity) and constructed K-Nearest Neighbors ($k=3$) graphs on scaled continuous features.
+
+---
+
+### PROBLEM NO.10: Edge Discarding via Index Mismatch
+**Description:** Nodes were added to NetworkX using their original DataFrame indices. When converting to PyTorch Geometric, boundary checks discarded all edges with indices `>= 120`. Consequently, all subgraphs after the first chunk were treated as having zero edges (isolated nodes).
+**FIX 10:** Used local node indices `0` to `len(sub) - 1` when adding nodes to the graph, preserving all edges.
+
+---
+
+### PROBLEM NO.11: Raw Categorical Float Input
+**Description:** Label-encoded protocol and service variables were fed directly as continuous floats into the GraphSAGE model. Since categories have no ordered numeric meaning, this confused the neural network.
+**FIX 11:** Refactored the `GraphSAGEClassifier` to use `nn.Embedding` for protocol and service features, mapping them to dense learned vectors, and updated the testing scripts to load saved encoders and config.
+
