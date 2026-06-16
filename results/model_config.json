@@ -1,7 +1,8 @@
 {
   "num_protos": 132,
   "num_services": 14,
-  "continuous_dim": 12,
+  "num_states": 8,
+  "continuous_dim": 39,
   "hidden_dim": 64,
   "num_classes": 10
 }

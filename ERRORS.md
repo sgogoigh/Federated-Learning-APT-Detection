@@ -68,3 +68,35 @@ This document serves as a catalogue of the architectural, programmatic, and pipe
 **Description:** Label-encoded protocol and service variables were fed directly as continuous floats into the GraphSAGE model. Since categories have no ordered numeric meaning, this confused the neural network.
 **FIX 11:** Refactored the `GraphSAGEClassifier` to use `nn.Embedding` for protocol and service features, mapping them to dense learned vectors, and updated the testing scripts to load saved encoders and config.
 
+---
+
+### PROBLEM NO.12: Sub-optimal Feature Subset (12 of 39 numeric columns)
+**Description:** The training pipeline only used 12 out of 39 available numeric features in the CSV, ignoring 27 highly descriptive attributes (like `sload`, `dload`, `tcprtt`, `smean`, `dmean`, and connection tables) which are vital for classifying network attacks.
+**FIX 12:** Expanded `NUMERIC_FEATURE_COLS` to include all 39 numeric features in the dataset.
+
+---
+
+### PROBLEM NO.13: Ignored `state` Categorical Column
+**Description:** The `state` categorical attribute (indicating connection status like CON, FIN, INT) was completely ignored by the model, despite being highly informative of DoS and scanning activities.
+**FIX 13:** Added label encoding and a 3rd `nn.Embedding` layer in the GNN model for connection state, bringing total features utilized to 42.
+
+---
+
+### PROBLEM NO.14: Hyper-aggressive Class Weighting (Class Collapse)
+**Description:** The balanced class weight formula created extreme ratios (e.g. $850:1$ for Worms vs. Normal). This penalized rare class errors so severely that the model over-predicted them at the slightest similarity, leading to high false positives and capping overall accuracy at 62.4%.
+**FIX 14:** Implemented square-root weight smoothing ($w_i = \sqrt{total / (num\_classes \times count)}$) to reduce the ratio to $29:1$. This stabilized loss and boosted accuracy to 82.3%.
+
+---
+
+### PROBLEM NO.15: Graph Topology Lacking Chronological Sequence
+**Description:** Constructing graphs purely on continuous feature similarity (KNN) made the GNN message passing redundant with the raw features, since it only averaged nodes that were already similar in feature space.
+**FIX 15:** Created a hybrid graph topology combining chronological temporal chain edges (connecting sequentially adjacent flows in the window) with KNN similarity edges.
+
+---
+
+### PROBLEM NO.16: Sub-optimal Early Stopping Metric (Validation Accuracy)
+**Description:** Local training early stopping was based on raw validation accuracy. Because accuracy is heavily dominated by majority classes (Normal/Generic), the local models early-stopped (often at epoch 5) before they could learn minority classes.
+**FIX 16:** Changed the early stopping metric to validation loss, which is smooth and represents true learning progress across all classes. We increased the patience to `5` and adjusted the class weight smoothing factor to a power of `0.6` to give slightly higher weight to minority classes.
+
+
+

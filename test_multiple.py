@@ -20,12 +20,16 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 torch.set_num_threads(1)
 
-# --- Feature config (must match train.py) ---
 NUMERIC_FEATURE_COLS = [
-    "dur", "sbytes", "dbytes", "spkts", "dpkts", "sinpkt",
-    "rate", "sttl", "dttl", "ct_srv_src", "ct_srv_dst", "ct_dst_ltm",
+    "dur", "spkts", "dpkts", "sbytes", "dbytes", "rate", "sttl", "dttl",
+    "sload", "dload", "sloss", "dloss", "sinpkt", "dinpkt", "sjit", "djit",
+    "swin", "stcpb", "dtcpb", "dwin", "tcprtt", "synack", "ackdat", "smean",
+    "dmean", "trans_depth", "response_body_len", "ct_srv_src", "ct_state_ttl",
+    "ct_dst_ltm", "ct_src_dport_ltm", "ct_dst_sport_ltm", "ct_dst_src_ltm",
+    "is_ftp_login", "ct_ftp_cmd", "ct_flw_http_mthd", "ct_src_ltm", "ct_srv_dst",
+    "is_sm_ips_ports"
 ]
-IN_DIM = 14
+IN_DIM = 42
 
 # --- Load model config ---
 config_path = "results/model_config.json"
@@ -36,8 +40,10 @@ else:
     model_config = {
         "num_protos": 134,
         "num_services": 14,
-        "num_classes": 10,
-        "hidden_dim": 64
+        "num_states": 12,
+        "continuous_dim": 39,
+        "hidden_dim": 64,
+        "num_classes": 10
     }
 
 # --- Load saved encoders ---
@@ -45,6 +51,8 @@ with open("results/proto_encoder.pkl", "rb") as f:
     le_proto = pickle.load(f)
 with open("results/service_encoder.pkl", "rb") as f:
     le_service = pickle.load(f)
+with open("results/state_encoder.pkl", "rb") as f:
+    le_state = pickle.load(f)
 
 def safe_encode(le, series, unseen_val="<unknown>"):
     classes = set(le.classes_)
@@ -56,12 +64,13 @@ def safe_encode(le, series, unseen_val="<unknown>"):
 
 # --- Model Definition ---
 class GraphSAGEClassifier(torch.nn.Module):
-    def __init__(self, num_protos, num_services, continuous_dim, hidden_dim, num_classes, dropout=0.3):
+    def __init__(self, num_protos, num_services, num_states, continuous_dim, hidden_dim, num_classes, dropout=0.3):
         super().__init__()
         self.proto_emb = torch.nn.Embedding(num_protos, 16)
         self.service_emb = torch.nn.Embedding(num_services, 8)
+        self.state_emb = torch.nn.Embedding(num_states, 8)
         
-        in_dim = continuous_dim + 16 + 8
+        in_dim = continuous_dim + 16 + 8 + 8
         self.conv1 = SAGEConv(in_dim, hidden_dim)
         self.conv2 = SAGEConv(hidden_dim, hidden_dim)
         self.fc = torch.nn.Linear(hidden_dim, num_classes)
@@ -70,14 +79,16 @@ class GraphSAGEClassifier(torch.nn.Module):
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
-        cont_feats = x[:, :12]
-        proto_idx = x[:, 12].long()
-        service_idx = x[:, 13].long()
+        cont_feats = x[:, :39]
+        proto_idx = x[:, 39].long()
+        service_idx = x[:, 40].long()
+        state_idx = x[:, 41].long()
         
         p_emb = self.proto_emb(proto_idx)
         s_emb = self.service_emb(service_idx)
+        st_emb = self.state_emb(state_idx)
         
-        x_emb = torch.cat([cont_feats, p_emb, s_emb], dim=1)
+        x_emb = torch.cat([cont_feats, p_emb, s_emb, st_emb], dim=1)
         
         x = self.relu(self.conv1(x_emb, edge_index))
         x = self.dropout(x)
@@ -115,7 +126,8 @@ print("Loading trained model weights...")
 net = GraphSAGEClassifier(
     num_protos=model_config["num_protos"],
     num_services=model_config["num_services"],
-    continuous_dim=12,
+    num_states=model_config["num_states"],
+    continuous_dim=39,
     hidden_dim=model_config["hidden_dim"],
     num_classes=num_classes
 ).to(DEVICE)
@@ -143,25 +155,27 @@ mitigation = {
 rng = np.random.RandomState(42)
 
 def make_synthetic_case(kind="generic"):
-    """Generate a synthetic 14-dim feature vector simulating different attack types."""
-    base = rng.normal(loc=0.0, scale=0.5, size=12).astype(np.float32)
+    """Generate a synthetic 42-dim feature vector simulating different attack types."""
+    # 39 continuous numeric features
+    base = rng.normal(loc=0.0, scale=0.5, size=39).astype(np.float32)
     proto_enc = float(rng.randint(0, model_config["num_protos"]))
     service_enc = float(rng.randint(0, model_config["num_services"]))
+    state_enc = float(rng.randint(0, model_config["num_states"]))
 
     if kind == "exploit":
         base[1], base[2] = 3.0, 2.5   # high sbytes/dbytes
     elif kind == "dos":
         base[3], base[4] = 4.0, 3.5   # high spkts/dpkts
     elif kind == "recon":
-        base[9], base[10] = 2.0, 2.0  # high ct_srv_src/ct_srv_dst
+        base[27], base[37] = 2.0, 2.0  # high ct_srv_src/ct_srv_dst in 39-feature set
     elif kind == "fuzzer":
-        base[11], base[5] = 2.0, 1.5  # high ct_dst_ltm/sinpkt
+        base[29], base[12] = 2.0, 1.5  # high ct_dst_ltm/sinpkt in 39-feature set
     elif kind == "normal":
-        base = rng.normal(loc=0.0, scale=0.2, size=12).astype(np.float32)
+        base = rng.normal(loc=0.0, scale=0.2, size=39).astype(np.float32)
     else:
-        base += rng.normal(loc=1.0, scale=0.8, size=12).astype(np.float32)
+        base += rng.normal(loc=1.0, scale=0.8, size=39).astype(np.float32)
 
-    return np.concatenate([base, [proto_enc, service_enc]]).astype(np.float32)
+    return np.concatenate([base, [proto_enc, service_enc, state_enc]]).astype(np.float32)
 
 
 # --- Run Synthetic Predictions ---
@@ -202,6 +216,7 @@ if os.path.exists(csv_file):
     # Encode
     df["proto_enc"] = safe_encode(le_proto, df["proto"].astype(str))
     df["service_enc"] = safe_encode(le_service, df["service"].astype(str))
+    df["state_enc"] = safe_encode(le_state, df["state"].astype(str))
 
     # Scale numeric
     for c in NUMERIC_FEATURE_COLS:
@@ -215,7 +230,7 @@ if os.path.exists(csv_file):
     sample = df.sample(1).iloc[0]
     features = np.concatenate([
         sample[NUMERIC_FEATURE_COLS].to_numpy(),
-        [sample["proto_enc"], sample["service_enc"]],
+        [sample["proto_enc"], sample["service_enc"], sample["state_enc"]],
     ]).astype(np.float32)
 
     x = torch.tensor(features).view(1, -1).to(DEVICE)

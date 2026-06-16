@@ -93,38 +93,31 @@ os.makedirs("results", exist_ok=True)
 # add rate, sttl, dttl to keep 14 features.
 # ---------------------------------------------------------------------------
 NUMERIC_FEATURE_COLS = [
-    "dur",            # flow duration
-    "sbytes",         # source bytes
-    "dbytes",         # destination bytes
-    "spkts",          # source packets
-    "dpkts",          # destination packets
-    "sinpkt",         # source inter-packet time
-    "rate",           # total packets/sec
-    "sttl",           # source TTL
-    "dttl",           # destination TTL
-    "ct_srv_src",     # conn count same srv+src
-    "ct_srv_dst",     # conn count same srv+dst
-    "ct_dst_ltm",     # conn count same dst recently
+    "dur", "spkts", "dpkts", "sbytes", "dbytes", "rate", "sttl", "dttl",
+    "sload", "dload", "sloss", "dloss", "sinpkt", "dinpkt", "sjit", "djit",
+    "swin", "stcpb", "dtcpb", "dwin", "tcprtt", "synack", "ackdat", "smean",
+    "dmean", "trans_depth", "response_body_len", "ct_srv_src", "ct_state_ttl",
+    "ct_dst_ltm", "ct_src_dport_ltm", "ct_dst_sport_ltm", "ct_dst_src_ltm",
+    "is_ftp_login", "ct_ftp_cmd", "ct_flw_http_mthd", "ct_src_ltm", "ct_srv_dst",
+    "is_sm_ips_ports"
 ]
 
-# These two will be label-encoded and appended as the last 2 features
 CAT_PROTO = "proto"
 CAT_SERVICE = "service"
-
-# Total features = 12 numeric + 2 encoded = 14
-IN_DIM = 14
+CAT_STATE = "state"
 
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 class GraphSAGEClassifier(nn.Module):
     """Two-layer GraphSAGE with embeddings for categorical features and continuous features."""
-    def __init__(self, num_protos, num_services, continuous_dim, hidden_dim, num_classes, dropout=0.3):
+    def __init__(self, num_protos, num_services, num_states, continuous_dim, hidden_dim, num_classes, dropout=0.3):
         super().__init__()
         self.proto_emb = nn.Embedding(num_protos, 16)
         self.service_emb = nn.Embedding(num_services, 8)
+        self.state_emb = nn.Embedding(num_states, 8)
         
-        in_dim = continuous_dim + 16 + 8
+        in_dim = continuous_dim + 16 + 8 + 8
         self.conv1 = SAGEConv(in_dim, hidden_dim)
         self.conv2 = SAGEConv(hidden_dim, hidden_dim)
         self.fc = nn.Linear(hidden_dim, num_classes)
@@ -133,14 +126,16 @@ class GraphSAGEClassifier(nn.Module):
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
-        cont_feats = x[:, :12]
-        proto_idx = x[:, 12].long()
-        service_idx = x[:, 13].long()
+        cont_feats = x[:, :39]
+        proto_idx = x[:, 39].long()
+        service_idx = x[:, 40].long()
+        state_idx = x[:, 41].long()
         
         p_emb = self.proto_emb(proto_idx)
         s_emb = self.service_emb(service_idx)
+        st_emb = self.state_emb(state_idx)
         
-        x_emb = torch.cat([cont_feats, p_emb, s_emb], dim=1)
+        x_emb = torch.cat([cont_feats, p_emb, s_emb, st_emb], dim=1)
         
         x = self.relu(self.conv1(x_emb, edge_index))
         x = self.dropout(x)
@@ -152,7 +147,7 @@ class GraphSAGEClassifier(nn.Module):
 # Preprocessing
 # ---------------------------------------------------------------------------
 def preprocess_df(df):
-    """Clean, encode, and scale the DataFrame. Returns (df, LabelEncoder, LabelEncoder, LabelEncoder)."""
+    """Clean, encode, and scale the DataFrame. Returns (df, LabelEncoder, LabelEncoder, LabelEncoder, LabelEncoder)."""
     df.columns = [c.strip().lower() for c in df.columns]  # normalise to lowercase
 
     # Normalise label naming: Backdoors → Backdoor
@@ -175,7 +170,7 @@ def preprocess_df(df):
         # derive from attack_cat if absent
         df["label"] = (df["attack_cat"] != "Normal").astype(int)
 
-    # Encode protocol and service safely (include "<unknown>" class)
+    # Encode protocol, service, and state safely (include "<unknown>" class)
     le_proto = LabelEncoder()
     unique_protos = df[CAT_PROTO].astype(str).unique()
     le_proto.fit(np.append(unique_protos, "<unknown>"))
@@ -185,6 +180,11 @@ def preprocess_df(df):
     unique_services = df[CAT_SERVICE].astype(str).unique()
     le_service.fit(np.append(unique_services, "<unknown>"))
     df["service_enc"] = le_service.transform(df[CAT_SERVICE].astype(str))
+
+    le_state = LabelEncoder()
+    unique_states = df[CAT_STATE].astype(str).unique()
+    le_state.fit(np.append(unique_states, "<unknown>"))
+    df["state_enc"] = le_state.transform(df[CAT_STATE].astype(str))
 
     # Ensure numeric columns are numeric
     for c in NUMERIC_FEATURE_COLS:
@@ -201,13 +201,13 @@ def preprocess_df(df):
     le_attack = LabelEncoder()
     df["attack_label"] = le_attack.fit_transform(df["attack_cat"])
 
-    return df, le_attack, le_proto, le_service
+    return df, le_attack, le_proto, le_service, le_state
 
 # ---------------------------------------------------------------------------
 # Graph construction
 # ---------------------------------------------------------------------------
 def build_graphs(df, max_nodes=120):
-    """Build PyG Data graphs by chunking chronologically and connecting using KNN."""
+    """Build PyG Data graphs by chunking chronologically and connecting via temporal chain + KNN similarity."""
     graphs = []
 
     # Chunk the sorted dataframe chronologically
@@ -221,7 +221,7 @@ def build_graphs(df, max_nodes=120):
         for local_idx, (orig_idx, row) in enumerate(sub.iterrows()):
             feats = np.concatenate([
                 row[NUMERIC_FEATURE_COLS].to_numpy(),
-                [row["proto_enc"], row["service_enc"]],
+                [row["proto_enc"], row["service_enc"], row["state_enc"]],
             ]).astype(np.float32)
             G.add_node(
                 local_idx,
@@ -234,17 +234,16 @@ def build_graphs(df, max_nodes=120):
         nodes = list(G.nodes)
         num_nodes = len(nodes)
 
-        # Build KNN edges on the 12 scaled continuous features
-        feats_numeric = np.array([G.nodes[n]["x"][:12] for n in G.nodes])
+        # 1. Build temporal chain edges
+        for a in range(num_nodes - 1):
+            G.add_edge(nodes[a], nodes[a + 1])
+
+        # 2. Build KNN edges on the 39 scaled continuous features
+        feats_numeric = np.array([G.nodes[n]["x"][:39] for n in G.nodes])
         dist = np.linalg.norm(feats_numeric[:, None, :] - feats_numeric[None, :, :], axis=-1)
 
-        k = 3
-        if num_nodes <= k + 1:
-            # Connect everyone if the graph is too small
-            for a in range(num_nodes):
-                for b in range(a + 1, num_nodes):
-                    G.add_edge(nodes[a], nodes[b])
-        else:
+        k = 2
+        if num_nodes > k + 1:
             for a in range(num_nodes):
                 # Argsort to find nearest neighbors
                 nearest = np.argsort(dist[a])
@@ -347,14 +346,15 @@ def train_local(graphs, global_state, num_classes, config, name):
     model = GraphSAGEClassifier(
         num_protos=config["num_protos"],
         num_services=config["num_services"],
-        continuous_dim=12,
+        num_states=config["num_states"],
+        continuous_dim=39,
         hidden_dim=config["hidden_dim"],
         num_classes=num_classes,
     ).to(DEVICE)
     if global_state:
         model.load_state_dict(global_state, strict=False)
 
-    # Balanced class weights: total_samples / (num_classes * class_count)
+    # Balanced class weights with smoothed power (0.6) to boost rare classes
     labels = []
     for g in graphs:
         labels.extend(g.y.tolist())
@@ -364,7 +364,7 @@ def train_local(graphs, global_state, num_classes, config, name):
     weights = torch.zeros(num_classes, dtype=torch.float32)
     for i in range(num_classes):
         if class_counts.get(i, 0) > 0:
-            weights[i] = total_samples / (num_classes * class_counts[i])
+            weights[i] = (total_samples / (num_classes * class_counts[i])) ** 0.6
         else:
             weights[i] = 0.0  # zero weight if class is entirely absent
     weights = weights.to(DEVICE)
@@ -376,7 +376,7 @@ def train_local(graphs, global_state, num_classes, config, name):
 
     best = None
     wait = 0
-    patience = 4
+    patience = 5
 
     for ep in range(config["epochs"]):
         model.train()
@@ -388,13 +388,24 @@ def train_local(graphs, global_state, num_classes, config, name):
             loss.backward()
             optimizer.step()
             losses.append(loss.item())
+        
+        # Compute validation loss
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for b in val_loader:
+                b = b.to(DEVICE)
+                val_loss = criterion(model(b), b.y)
+                val_losses.append(val_loss.item())
+        mean_val_loss = np.mean(val_losses)
+        
         val_acc, _, _, val_f1, _, _ = evaluate(model, val_loader, num_classes)
         print(
             f"  [{name}] Epoch {ep+1} loss={np.mean(losses):.4f} "
-            f"val_acc={val_acc:.3f} f1={val_f1:.3f}"
+            f"val_loss={mean_val_loss:.4f} val_acc={val_acc:.3f} f1={val_f1:.3f}"
         )
-        if val_acc > (best[0] if best else 0):
-            best = (val_acc, copy.deepcopy(model.state_dict()))
+        if best is None or mean_val_loss < best[0]:
+            best = (mean_val_loss, copy.deepcopy(model.state_dict()))
             wait = 0
         else:
             wait += 1
@@ -404,7 +415,7 @@ def train_local(graphs, global_state, num_classes, config, name):
 
     if best is None:
         # fallback: use current weights
-        best = (0.0, copy.deepcopy(model.state_dict()))
+        best = (float('inf'), copy.deepcopy(model.state_dict()))
 
     model.load_state_dict(best[1])
     test_loader = DataLoader(test_data, batch_size=8)
@@ -466,9 +477,10 @@ def main(args):
     # 2. Preprocess
     # ------------------------------------------------------------------
     print("Preprocessing...")
-    df, attack_enc, le_proto, le_service = preprocess_df(df)
+    df, attack_enc, le_proto, le_service, le_state = preprocess_df(df)
     num_protos = len(le_proto.classes_)
     num_services = len(le_service.classes_)
+    num_states = len(le_state.classes_)
     num_classes = len(attack_enc.classes_)
     print(f"  Classes ({num_classes}): {list(attack_enc.classes_)}")
     print(f"  Class distribution:")
@@ -511,6 +523,7 @@ def main(args):
         "hidden_dim": args.hidden_dim,
         "num_protos": num_protos,
         "num_services": num_services,
+        "num_states": num_states,
     }
 
     global_state = None
@@ -580,10 +593,15 @@ def main(args):
         pickle.dump(le_service, f)
     print("Saved results/service_encoder.pkl")
 
+    with open("results/state_encoder.pkl", "wb") as f:
+        pickle.dump(le_state, f)
+    print("Saved results/state_encoder.pkl")
+
     model_config = {
         "num_protos": num_protos,
         "num_services": num_services,
-        "continuous_dim": 12,
+        "num_states": num_states,
+        "continuous_dim": 39,
         "hidden_dim": args.hidden_dim,
         "num_classes": num_classes,
     }
@@ -602,7 +620,8 @@ def main(args):
         global_net = GraphSAGEClassifier(
             num_protos=config["num_protos"],
             num_services=config["num_services"],
-            continuous_dim=12,
+            num_states=config["num_states"],
+            continuous_dim=39,
             hidden_dim=config["hidden_dim"],
             num_classes=num_classes,
         ).to(DEVICE)
