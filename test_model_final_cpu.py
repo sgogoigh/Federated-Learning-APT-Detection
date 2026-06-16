@@ -56,11 +56,10 @@ class GraphSAGEClassifier(nn.Module):
         self.relu = nn.ReLU()
 
     def forward(self, data):
-        x, edge_index, batch = data.x, data.edge_index, data.batch
+        x, edge_index = data.x, data.edge_index
         x = self.relu(self.conv1(x, edge_index))
         x = self.dropout(x)
         x = self.relu(self.conv2(x, edge_index))
-        x = global_mean_pool(x, batch)
         return self.fc(self.dropout(x))
 
 # --- Load Model ---

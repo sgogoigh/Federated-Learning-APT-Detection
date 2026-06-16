@@ -1,0 +1,51 @@
+# APT Detection Federated Learning - Known Errors and Fixes
+
+This document serves as a catalogue of the architectural, programmatic, and pipeline errors we encountered during the development of this Federated Learning system, and the corresponding fixes we implemented.
+
+---
+
+### PROBLEM NO.1: Missing / Dropped Fully Connected (`fc`) Layer during Inference
+**Description:** The test scripts (`test_model_final.py` and `test_multiple.py`) were manually filtering out the `fc.` layer parameters when loading the model's `state_dict`. As a result, the model's classification head was initialized with random weights during testing, leading to completely garbage outputs.
+**FIX 1:** We updated all inference scripts to use `strict=False` and properly load the complete state dictionary (including the trained `fc.` layer) to retain the learned classification capabilities.
+
+---
+
+### PROBLEM NO.2: Inconsistent Label Decoding
+**Description:** The test scripts were hardcoding label arrays or instantiating a brand-new `LabelEncoder` during inference based on a small batch of test data. Because the encoding order changes depending on the data subset, the network's predictions were completely misaligned from the training labels.
+**FIX 2:** Modified the main training script (`train.py`) to persist the fitted `LabelEncoder` as a pickle object (`results/attack_encoder.pkl`). The testing scripts now load this object to decode predictions consistently.
+
+---
+
+### PROBLEM NO.3: AUC Computation Crashing on Partial Batches
+**Description:** The `roc_auc_score` function failed and returned a silent `0.0` or threw an error because partial evaluation sets (e.g., during validation) didn't always contain samples representing every single attack class.
+**FIX 3:** Passed the explicit argument `labels=list(range(num_classes))` to the `roc_auc_score` function inside the `evaluate()` loop. This explicitly informs scikit-learn of all the possible classes, allowing it to correctly compute the Macro AUC even if certain classes have zero support in that specific batch.
+
+---
+
+### PROBLEM NO.4: Environment Variable File Path Quotation Error
+**Description:** The script loaded the dataset path from the `.env` file using `python-dotenv`. However, Windows paths enclosed in quotes (`DATASET_PATH="C:\..."`) were parsed literally. When appended to the filename using `os.path.join`, it formed an invalid path like `"C:\..."\UNSW_NB15_training-set.csv` and threw a `FileNotFoundError`.
+**FIX 4:** Added `.strip('"').strip("'")` right after fetching the environment variable in all scripts to sanitize the string before executing file operations.
+
+---
+
+### PROBLEM NO.5: Classification Report ValueError
+**Description:** During the Global Test Set evaluation, the `classification_report` function crashed with `ValueError: Number of classes, 5, does not match size of target_names, 10`. This happened because the random 10% test split did not naturally contain the rarest APT classes (e.g., Worms, Shellcode).
+**FIX 5:** Passed `labels=list(range(num_classes))` to `classification_report()` to force it to evaluate and display all 10 target classes, outputting a `0` score for any missing categories rather than crashing.
+
+---
+
+### PROBLEM NO.6: Graph-Level Classification Causing Minority Class Erasure
+**Description:** The initial architecture built graphs by taking 120 chronological network flows, connecting them, and assigning a single "majority" label to the entire graph. Because "Normal" and "Generic" classes dominate the dataset (75%), the minority APT classes were entirely erased during graph construction, resulting in massive class collapse.
+**FIX 6:** Swapped the architectural design from **Graph-Level Classification** to **Node-Level Classification**. We removed `global_mean_pool` from the `GraphSAGEClassifier` and assigned labels per individual node, forcing the network to evaluate and classify all 82,332 original flows independently while preserving minority attacks.
+
+---
+
+### PROBLEM NO.7: FedAvg Catastrophic Forgetting via Non-IID Partitioning
+**Description:** The client partitioning function (`create_clients`) used KMeans clustering on specific connection features (like Protocols and Services). This clustered the dataset into highly restricted, Non-IID partitions. One client would see only HTTP traffic, while another saw only DNS traffic. Local models rapidly "forgot" classes they weren't seeing, and when averaged globally, the competing extreme biases destroyed the network.
+**FIX 7:** Replaced the KMeans logic with a randomized shuffle (IID distribution). Distributing graphs uniformly ensures every client gets a representative baseline of all protocols and attacks, eliminating the catastrophic forgetting.
+
+---
+
+### PROBLEM NO.8: Exploding Loss Gradients due to Missing Classes
+**Description:** The `train_local` script calculated inverse-frequency class weights using the formula `1.0 / (count + 1e-6)`. If a local client partition happened to be missing an attack class entirely (count = 0), the loss penalty weight for that class skyrocketed to `1,000,000`, destabilizing gradients and halting convergence.
+**FIX 8:** Implemented a mathematically stable balanced weighting formula (`total_samples / (num_classes * class_count)`). If a class is completely absent, its weight is gracefully set to `0.0`.

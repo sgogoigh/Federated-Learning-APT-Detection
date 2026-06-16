@@ -128,11 +128,10 @@ class GraphSAGEClassifier(nn.Module):
         self.relu = nn.ReLU()
 
     def forward(self, data):
-        x, edge_index, batch = data.x, data.edge_index, data.batch
+        x, edge_index = data.x, data.edge_index
         x = self.relu(self.conv1(x, edge_index))
         x = self.dropout(x)
         x = self.relu(self.conv2(x, edge_index))
-        x = global_mean_pool(x, batch)
         return self.fc(self.dropout(x))
 
 # ---------------------------------------------------------------------------
@@ -242,9 +241,8 @@ def build_graphs(df, max_nodes=120):
                 edges = edges[(edges[:, 0] < max_idx) & (edges[:, 1] < max_idx)]
                 edge_index = torch.from_numpy(edges.T)
 
-            # Graph-level label = majority attack class
-            label = Counter([G.nodes[n]["y"] for n in G.nodes]).most_common(1)[0][0]
-            y = torch.tensor([label], dtype=torch.long)
+            # Node-level label
+            y = torch.tensor([G.nodes[n]["y"] for n in G.nodes], dtype=torch.long)
             binary = torch.tensor(
                 [1 if any(G.nodes[n]["label"] for n in G.nodes) else 0],
                 dtype=torch.long,
@@ -263,15 +261,11 @@ def build_graphs(df, max_nodes=120):
 # Client partitioning
 # ---------------------------------------------------------------------------
 def create_clients(graphs, num_clients):
-    """Partition graphs into clients via KMeans on feature centroids."""
-    feats = np.array([
-        [np.mean(g.x[:, -2].numpy()), np.mean(g.x[:, -1].numpy())]
-        for g in graphs
-    ])
-    kmeans = KMeans(n_clusters=num_clients, random_state=SEED, n_init=10).fit(feats)
+    """Partition graphs into clients randomly (IID) to prevent FedAvg catastrophic forgetting."""
+    random.shuffle(graphs)
     clients = {i: [] for i in range(num_clients)}
-    for i, lbl in enumerate(kmeans.labels_):
-        clients[lbl].append(graphs[i])
+    for i, g in enumerate(graphs):
+        clients[i % num_clients].append(g)
     return clients
 
 # ---------------------------------------------------------------------------
@@ -332,14 +326,20 @@ def train_local(graphs, global_state, num_classes, config, name):
     if global_state:
         model.load_state_dict(global_state, strict=False)
 
-    # Inverse-frequency class weights
-    labels = [g.y.item() for g in graphs]
+    # Balanced class weights: total_samples / (num_classes * class_count)
+    labels = []
+    for g in graphs:
+        labels.extend(g.y.tolist())
     class_counts = Counter(labels)
-    epsilon = 1e-6
-    weights = torch.tensor(
-        [1.0 / (class_counts.get(i, 0) + epsilon) for i in range(num_classes)],
-        dtype=torch.float32,
-    ).to(DEVICE)
+    total_samples = len(labels)
+    
+    weights = torch.zeros(num_classes, dtype=torch.float32)
+    for i in range(num_classes):
+        if class_counts.get(i, 0) > 0:
+            weights[i] = total_samples / (num_classes * class_counts[i])
+        else:
+            weights[i] = 0.0  # zero weight if class is entirely absent
+    weights = weights.to(DEVICE)
 
     criterion = nn.CrossEntropyLoss(weight=weights)
     optimizer = optim.Adam(model.parameters(), lr=config["lr"], weight_decay=config["wd"])
