@@ -1,8 +1,7 @@
 # UNSW-NB15 Dataset — Comprehensive Reference
 
 > **Kaggle Source**: [mrwellsdavid/unsw-nb15](https://www.kaggle.com/datasets/mrwellsdavid/unsw-nb15)  
-> **Downloaded via**: `kagglehub.dataset_download("mrwellsdavid/unsw-nb15")`  
-> **Local Path**: `C:\Users\sgogo\OneDrive\Desktop\APT Detection Fed Learning\datasets\mrwellsdavid\unsw-nb15\versions\1`  
+> **Downloaded via**: `kagglehub.dataset_download("mrwellsdavid/unsw-nb15")`   
 > **Environment Variable**: `DATASET_PATH` (set in `.env`)
 
 ---
@@ -46,11 +45,6 @@ The dataset captures **network flow records** (similar to NetFlow) extracted fro
 
 ## 2. File Inventory
 
-All files are located at:
-```
-C:\Users\sgogo\OneDrive\Desktop\APT Detection Fed Learning\
-datasets\mrwellsdavid\unsw-nb15\versions\1\
-```
 
 | File | Size | Rows | Description |
 |---|---|---|---|
@@ -340,8 +334,6 @@ print("Path to dataset files:", path)
 |---|---|
 | Dataset identifier | `mrwellsdavid/unsw-nb15` |
 | Download size (compressed) | ~149 MB |
-| Download time (observed) | ~33 min 45 sec on measured connection |
-| Default cache location | `C:\Users\sgogo\.cache\kagglehub\datasets\mrwellsdavid\unsw-nb15\versions\1` |
 | Moved to project location | `C:\...\APT Detection Fed Learning\datasets\mrwellsdavid\unsw-nb15\versions\1` |
 | Environment variable | `DATASET_PATH` in `.env` file |
 
