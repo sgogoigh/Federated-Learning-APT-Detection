@@ -121,4 +121,59 @@ held-out set counts.
 
 ---
 
+# Run 2 — After the P0-A / cheap-L2 fixes (June 2026)
+
+> Changes since Run 1: FedAdam server optimizer + shared client init; adaptive local epochs
+> (25, patience 5); signed-log1p feature transform; class-balanced focal weights; per-round
+> official-test monitoring; **best-by-validation checkpointing** (val split flow-level before
+> oversampling, so the official test set is never used for model selection).
+
+## R8 — The Round-2 collapse is gone; convergence is now healthy
+
+FedAdam + a shared initial model (all clients start round 1 from the same weights, driven by a
+persistent server-side Adam) eliminated the catastrophic Round-2 dip from Run 1 (R4). The
+official-test macro-F1 now *climbs* across rounds instead of collapsing, and **early-stopping
+fired 44 times vs 1** — confirming the adaptive 25-epoch budget cured the early-round
+under-fitting. The L1 (optimization) diagnosis and fix were correct.
+
+## R9 — Federation reached parity; it now costs ≈0
+
+Final comparison (official test, best-val checkpoint):
+
+| model | accuracy | macro-F1 | AUC |
+|---|---|---|---|
+| `mlp_flow` | 0.752 | 0.391 | 0.946 |
+| `centralized_gnn` | 0.729 | 0.386 | 0.940 |
+| `federated_gnn` | 0.712 | **0.390** | 0.940 |
+
+All three now sit within noise of each other on macro-F1 (≈0.39). In Run 1 the federated model
+*trailed* centralized (0.386 vs 0.393); now it *matches* it. **The cost of federation has been
+driven to ≈0 by FedAdam** — exactly the L1 win the plan promised.
+
+## R10 — The representational ceiling is real and still unbroken
+
+Optimization is no longer the bottleneck — and the ceiling didn't move. Every model clusters at
+**macro-F1 ≈ 0.39, AUC ≈ 0.94**, and the GNN still does **not** beat the per-flow MLP. This
+confirms IMPROVEMENTS Part III's central claim: L1 fixes bring the federated model *up to* the
+ceiling but cannot break it. Breaking it requires changing the representation (the real
+host/time graph, L2) and the rare-class strategy (two-stage detection, L3) — not more compute.
+
+## R11 — Single-run comparisons are unreliable; the dataset is too small for one seed
+
+The MLP's macro-F1 was 0.414 (Run 1), 0.428 (Run 2a, +log1p), and 0.391 (this run, after a 10%
+val holdout shrank its training data). Swings of ~0.03–0.04 from data/seed alone are larger than
+the gaps *between models*. With only a few hundred graphs (R3), **any model-vs-model verdict must
+be averaged over multiple seeds** before it can be trusted. The headline "GNN ≈ MLP" is robust;
+finer rankings are not.
+
+## R12 — Validation macro-F1 is only a loose proxy for official-test macro-F1
+
+Best-by-validation selected round 12 (val 0.470 → official 0.390), but the official-test optimum
+was round 5 (0.413). Validation (drawn from the *train* distribution) systematically mispredicts
+the official test under UNSW's deliberate train→test shift (R7). Selecting on validation is still
+the only honest choice — but the val↔test gap is itself a quantified symptom of the shift, and a
+reason a *re-stratified* benchmark (IMPROVEMENTS Part III #13) should be reported alongside.
+
+---
+
 *Living document. Append a new R-entry after every substantive run.*

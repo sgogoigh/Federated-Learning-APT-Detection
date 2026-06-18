@@ -1,19 +1,22 @@
 {
-  "accuracy": 0.7002640568948506,
-  "weighted_f1": 0.6853796288014313,
-  "macro_f1": 0.3858728644285693,
-  "auc": 0.9293734883136618,
+  "accuracy": 0.7124517369012382,
+  "weighted_f1": 0.683844718671267,
+  "macro_f1": 0.3904089123543392,
+  "auc": 0.940018948749009,
   "per_class_recall": {
-    "Analysis": 0.0365,
-    "Backdoor": 0.0286368843069874,
-    "DoS": 0.7057240704500979,
-    "Exploits": 0.4121821938729674,
-    "Fuzzers": 0.11009678838539376,
-    "Generic": 0.97785,
-    "Normal": 0.9506785714285715,
-    "Reconnaissance": 0.5288342388714136,
-    "Shellcode": 0.20653133274492497,
-    "Worms": 0.823076923076923
+    "Analysis": 0.0,
+    "Backdoor": 0.02004581901489118,
+    "DoS": 0.5235649054142205,
+    "Exploits": 0.5139999401072081,
+    "Fuzzers": 0.04729432468103827,
+    "Generic": 0.9773,
+    "Normal": 0.9799107142857143,
+    "Reconnaissance": 0.5615289295586693,
+    "Shellcode": 0.43071491615180935,
+    "Worms": 0.7384615384615385
   },
-  "num_samples": 175341
+  "num_samples": 175341,
+  "selected_round": 12,
+  "val_macro_f1_at_selection": 0.4704141324495666,
+  "selection": "best validation macro-F1 (official test never used for selection)"
 }

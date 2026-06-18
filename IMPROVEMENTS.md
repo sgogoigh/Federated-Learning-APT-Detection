@@ -892,6 +892,38 @@ centralized ceiling (~0.39–0.40). Does **not** break the ceiling.
 - **Process:** no Round-2-style collapse in the convergence curve; per-round official-test
   macro-F1 monotone-ish and plateauing — *visible*, not inferred.
 
+## 12. Implementation status — Run 2 (June 2026)
+
+What from §10 is now **implemented in `train.py`** and verified by a full run (see
+REVELATIONS R8–R12):
+
+| Plan item | Status | Result |
+|---|---|---|
+| P0-A #1 Server optimizer (FedAdam/FedOpt, persistent momentum, shared init) | ✅ done | `ServerOpt` class; `--server_opt`/`--server_lr`. Killed the Round-2 collapse (R8). |
+| P0-A #2 Adaptive local epochs (25, patience 5) | ✅ done | 44 early-stops vs 1; under-fitting cured (R8). |
+| P0-A #3 FedProx tunable | ✅ exposed | `--fedprox_mu` (default 0.01). Sweep still pending. |
+| P0-A #4 Per-round official-test eval + trajectory | ✅ done | `results/official_trajectory.json` + `learning_curves.png` (val vs test vs MLP line). |
+| P0-B #6 Heavy-tail feature transform | ✅ done | `_signed_log1p` lifted every model's floor (R9). |
+| P1 #11 Class-balanced focal weights | ✅ done | `cb_alpha` (`--cb_beta`); oversample floor lowered 1500→800. |
+| (new) Best-by-**validation** checkpointing | ✅ done | flow-level val split before oversampling; official test never used for selection (R12). |
+| P1 #12 macro-F1 / per-class headline | ✅ done | Headline everywhere; weighted-acc demoted. |
+| P1 #13 Distribution-shift print | ✅ done | train%→test% table at startup. |
+
+**Outcome:** federation reached parity with the centralized GNN and the MLP at macro-F1 ≈0.39
+(R9). **Optimization is no longer the bottleneck — the representational ceiling is (R10).**
+
+### Still open (the real accuracy levers — next chunk)
+- **P0-B #5 — host/time communication graph from the raw partitions** (`UNSW-NB15_1..4.csv`).
+  This is now the highest-priority item: the only change that can plausibly push the GNN past
+  the MLP. Until it lands, the GNN is not justified over the simpler MLP.
+- **P1 #8/#9/#10 — rare-class strategy**: two-stage (binary → fine-grained) detector; merge or
+  source-more-data for Worms/Shellcode; per-class threshold calibration. The current run still
+  shows Analysis/Backdoor ≈0 F1 and Worms over-triggered (recall 0.74 / precision 0.02).
+- **Multi-seed evaluation** (R11): report mean ± std over ≥3 seeds before trusting any
+  model-vs-model ranking; single runs swing ~0.03–0.04 macro-F1.
+- **P0-A #3 / server_lr sweep**: the official-test trajectory still oscillates ±0.05 round-to-
+  round; tune `--server_lr` (try 0.05) and `--fedprox_mu`, or add server-LR decay.
+
 ---
 
 *This document is maintained alongside the project and should be updated after each training run.*

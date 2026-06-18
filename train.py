@@ -216,6 +216,14 @@ def _apply_cat(series, le, known, unk_idx):
     return le.transform(s)
 
 
+def _signed_log1p(df):
+    """P0-B/L2: tame heavy-tailed network features (bytes, load, rate, ...) with a signed
+    log so StandardScaler doesn't squash 99% of the mass into a sliver. Robust to any sign."""
+    arr = df[NUMERIC_FEATURE_COLS].to_numpy(np.float64)
+    df[NUMERIC_FEATURE_COLS] = (np.sign(arr) * np.log1p(np.abs(arr))).astype(np.float64)
+    return df
+
+
 def fit_preprocessor(df_train):
     """Fit scaler + categorical/attack encoders on the TRAIN dataframe only."""
     df = df_train.copy()
@@ -233,6 +241,7 @@ def fit_preprocessor(df_train):
         if c not in df.columns:
             df[c] = 0.0
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    df = _signed_log1p(df)                          # L2: before fitting the scaler
 
     scaler = StandardScaler().fit(df[NUMERIC_FEATURE_COLS])
 
@@ -261,6 +270,7 @@ def transform_df(df_in, pre):
         if c not in df.columns:
             df[c] = 0.0
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    df = _signed_log1p(df)                          # L2: same transform fit on train
     df[NUMERIC_FEATURE_COLS] = pre["scaler"].transform(df[NUMERIC_FEATURE_COLS])
 
     # Drop rows whose attack_cat the train encoder never saw (keeps label space consistent)
@@ -362,6 +372,34 @@ def class_alpha(labels, num_classes, power=0.5):
         if counts.get(i, 0) == 0:
             w[i] = mean_w                                   # neutral, avoids unpenalised FP
     return w
+
+
+def cb_alpha(labels, num_classes, beta=0.999):
+    """P1/L3: class-balanced weights via effective number of samples (Cui et al. 2019).
+    w_i = (1-beta)/(1-beta^n_i), absent classes -> neutral mean, normalised to mean 1.
+    Gentler than flat inverse-frequency on ultra-rare classes, so it pairs with a lower
+    oversample floor and avoids the Worms over-trigger."""
+    if beta <= 0:
+        return class_alpha(labels, num_classes)
+    counts = Counter(labels)
+    w = torch.zeros(num_classes, dtype=torch.float32)
+    present = []
+    for i in range(num_classes):
+        n = counts.get(i, 0)
+        if n > 0:
+            eff = 1.0 - beta ** n
+            w[i] = (1.0 - beta) / max(eff, 1e-12)
+            present.append(w[i].item())
+    mean_w = float(np.mean(present)) if present else 1.0
+    for i in range(num_classes):
+        if counts.get(i, 0) == 0:
+            w[i] = mean_w
+    denom = w[w > 0].mean() if (w > 0).any() else torch.tensor(1.0)
+    return w / denom                                        # mean ~1 -> stable with fixed LR
+
+
+def make_weights(labels, num_classes, config):
+    return cb_alpha(labels, num_classes, beta=config.get("cb_beta", 0.999))
 
 
 # ===========================================================================
@@ -466,7 +504,7 @@ def train_local(graphs, global_state, num_classes, config, name):
         global_params = [p.detach().clone() for p in model.parameters()]
 
     labels = [int(v) for g in graphs for v in g.y.tolist()]
-    alpha = class_alpha(labels, num_classes).to(DEVICE)
+    alpha = make_weights(labels, num_classes, config).to(DEVICE)
     criterion = FocalLoss(alpha, gamma=config["focal_gamma"])
     optimizer = optim.Adam(model.parameters(), lr=config["lr"], weight_decay=config["wd"])
 
@@ -522,6 +560,35 @@ def fedavg(states, weights):
     return avg
 
 
+class ServerOpt:
+    """P0-A/L1: server-side FedOpt optimizer (Reddi et al. 2021).
+
+    'fedavg'  — plain sample-weighted averaging (no server momentum).
+    'fedadam' — applies the weighted client delta as a pseudo-gradient through a persistent
+                Adam-style server optimizer, so momentum is NOT reset every round. This is the
+                fix for the Round-2 collapse / cold re-climb (REVELATIONS R4)."""
+
+    def __init__(self, init_state, mode="fedadam", lr=0.1, b1=0.9, b2=0.99, tau=1e-3):
+        self.mode, self.lr, self.b1, self.b2, self.tau = mode, lr, b1, b2, tau
+        self.global_state = {k: v.detach().float().clone() for k, v in init_state.items()}
+        self.m = {k: torch.zeros_like(v) for k, v in self.global_state.items()}
+        self.v = {k: torch.zeros_like(v) for k, v in self.global_state.items()}
+
+    def step(self, client_states, weights):
+        total = float(sum(weights)) or 1.0
+        avg = {k: sum(s[k].float() * w for s, w in zip(client_states, weights)) / total
+               for k in self.global_state.keys()}
+        if self.mode == "fedavg":
+            self.global_state = avg
+            return self.global_state
+        for k in self.global_state.keys():
+            delta = avg[k] - self.global_state[k]               # aggregated client update
+            self.m[k] = self.b1 * self.m[k] + (1 - self.b1) * delta
+            self.v[k] = self.b2 * self.v[k] + (1 - self.b2) * delta * delta
+            self.global_state[k] = self.global_state[k] + self.lr * self.m[k] / (self.v[k].sqrt() + self.tau)
+        return self.global_state
+
+
 # ===========================================================================
 # F9: baselines (trained centrally, evaluated on official test set)
 # ===========================================================================
@@ -542,7 +609,7 @@ def train_mlp_baseline(train_df, test_df, config, num_classes, epochs=15):
     model = MLPClassifier(config["num_protos"], config["num_services"],
                           config["num_states"], CONT_DIM, config["hidden_dim"],
                           num_classes).to(DEVICE)
-    alpha = class_alpha(train_df["attack_label"].tolist(), num_classes).to(DEVICE)
+    alpha = make_weights(train_df["attack_label"].tolist(), num_classes, config).to(DEVICE)
     crit = FocalLoss(alpha, gamma=config["focal_gamma"])
     opt = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     for ep in range(epochs):
@@ -565,7 +632,7 @@ def train_centralized_gnn(train_graphs, test_graphs, config, num_classes, epochs
                                 config["num_states"], CONT_DIM, config["hidden_dim"],
                                 num_classes).to(DEVICE)
     labels = [int(v) for g in train_graphs for v in g.y.tolist()]
-    alpha = class_alpha(labels, num_classes).to(DEVICE)
+    alpha = make_weights(labels, num_classes, config).to(DEVICE)
     crit = FocalLoss(alpha, gamma=config["focal_gamma"])
     opt = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     loader = DataLoader(train_graphs, batch_size=8, shuffle=True)
@@ -684,29 +751,45 @@ def main(args):
         df_train, df_test = df_train.iloc[:cut].reset_index(drop=True), df_train.iloc[cut:].reset_index(drop=True)
     print(f"  Test rows: {len(df_test):,}")
 
-    print("  Train class distribution (pre-oversample):")
+    # L3: make the train->test distribution shift explicit
+    print("  Class distribution  (train% -> test%)  [pre-oversample]:")
+    n_tr, n_te = len(df_train), max(len(df_test), 1)
     for c in attack_enc.classes_:
-        print(f"    {c:18s}: {(df_train['attack_cat'] == c).sum():>7,}")
+        tr = (df_train["attack_cat"] == c).sum()
+        te = (df_test["attack_cat"] == c).sum()
+        print(f"    {c:18s}: {tr:>7,} ({100*tr/n_tr:5.1f}%) -> {te:>7,} ({100*te/n_te:5.1f}%)")
 
-    # F4: oversample minorities in TRAIN only
-    df_train_os = oversample_minorities(df_train, args.oversample_floor)
+    # Hold out a GLOBAL validation set at the flow level BEFORE oversampling, so val never
+    # contains oversampled duplicates of train rows. Used only for best-checkpoint selection
+    # (the official test set is never used for model selection).
+    perm = RNG.permutation(len(df_train))
+    n_val = int(args.val_frac * len(df_train))
+    df_val = df_train.iloc[perm[:n_val]].reset_index(drop=True)
+    df_tr = df_train.iloc[perm[n_val:]].reset_index(drop=True)
+
+    # F4: oversample minorities in the TRAIN portion only
+    df_train_os = oversample_minorities(df_tr, args.oversample_floor)
     if args.oversample_floor > 0:
-        print(f"  After oversampling (floor={args.oversample_floor}): {len(df_train_os):,} train rows")
+        print(f"  After oversampling (floor={args.oversample_floor}): {len(df_train_os):,} train rows "
+              f"(+ {len(df_val):,} held-out val)")
 
     # F3: build graphs
     print("\nBuilding graphs...")
     train_graphs = build_graphs(df_train_os, args.window, args.knn)
+    val_graphs = build_graphs(df_val, args.window, args.knn)
     test_graphs = build_graphs(df_test, args.window, args.knn)
-    print(f"  Train graphs: {len(train_graphs):,}  Test graphs: {len(test_graphs):,}")
+    print(f"  Train graphs: {len(train_graphs):,}  Val graphs: {len(val_graphs):,}  "
+          f"Test graphs: {len(test_graphs):,}")
 
     config = {
         "epochs": args.epochs_local, "lr": 1e-3, "wd": 1e-4,
         "hidden_dim": args.hidden_dim, "num_protos": num_protos,
         "num_services": num_services, "num_states": num_states,
         "fedprox_mu": args.fedprox_mu, "focal_gamma": args.focal_gamma,
-        "patience": args.patience,
+        "patience": args.patience, "cb_beta": args.cb_beta,
     }
     test_loader = DataLoader(test_graphs, batch_size=8)
+    val_loader = DataLoader(val_graphs, batch_size=8)
 
     # ---- F9: baselines ----
     comparison = {}
@@ -724,8 +807,25 @@ def main(args):
         print(f"  Client {i+1}: {len(clients[i]):,} graphs")
 
     # ---- Federated loop ----
-    global_state = None
+    # P0-A: shared initial weights for ALL clients from round 1 (removes random-init
+    # averaging), driven by a persistent server optimizer (FedAdam by default).
+    init_model = GraphSAGEClassifier(num_protos, num_services, num_states, CONT_DIM,
+                                     args.hidden_dim, num_classes).to(DEVICE)
+    server = ServerOpt(init_model.state_dict(), mode=args.server_opt, lr=args.server_lr)
+    global_state = server.global_state
+    print(f"\nServer optimizer: {args.server_opt} (lr={args.server_lr}), "
+          f"local epochs={args.epochs_local} patience={args.patience}, "
+          f"fedprox_mu={args.fedprox_mu}, cb_beta={args.cb_beta}")
+
+    # reusable net for per-round official-test evaluation (P0-A #4)
+    global_net = GraphSAGEClassifier(num_protos, num_services, num_states, CONT_DIM,
+                                     args.hidden_dim, num_classes).to(DEVICE)
+
     allres = {}
+    official_traj = []                                       # per-round metrics (val + official)
+    best_val_f1 = -1.0
+    best_state = copy.deepcopy(global_state)                 # best-by-validation checkpoint
+    best_round = 0
     for r in range(args.rounds):
         print("\n" + "=" * 60 + f"\nRound {r+1}/{args.rounds}\n" + "=" * 60)
         states, sample_weights, roundm = [], [], {}
@@ -740,14 +840,30 @@ def main(args):
         if not states:
             print("  [ERROR] No client produced a model this round.")
             continue
-        global_state = fedavg(states, sample_weights)        # F7: weighted
-        torch.save(global_state, "results/global_model.pt")
+        global_state = server.step(states, sample_weights)  # P0-A: FedAdam/FedAvg
         allres[f"Round{r+1}"] = roundm
 
-    # ---- Final federated evaluation on official test set ----
-    print("\n" + "=" * 60 + "\nFederated Global Model — Official Test Set\n" + "=" * 60)
-    global_net = GraphSAGEClassifier(num_protos, num_services, num_states, CONT_DIM,
-                                     args.hidden_dim, num_classes).to(DEVICE)
+        # Validation (for model selection) + official test (for monitoring only)
+        global_net.load_state_dict(global_state, strict=False)
+        vm = evaluate(global_net, val_loader, num_classes)
+        om = evaluate(global_net, test_loader, num_classes)
+        official_traj.append({"round": r + 1, "val_macro_f1": vm["macro_f1"],
+                              "acc": om["acc"], "macro_f1": om["macro_f1"], "auc": om["auc"]})
+        oauc = f"{om['auc']:.3f}" if om["auc"] is not None else "n/a"
+        print(f"\n  >> Round {r+1}: val_macroF1={vm['macro_f1']:.3f} | "
+              f"official acc={om['acc']:.3f} macroF1={om['macro_f1']:.3f} auc={oauc}")
+
+        # Best-by-VALIDATION checkpoint (never selects on the test set)
+        if vm["macro_f1"] > best_val_f1:
+            best_val_f1 = vm["macro_f1"]
+            best_state = copy.deepcopy(global_state)
+            best_round = r + 1
+            torch.save(best_state, "results/global_model.pt")
+
+    # ---- Final federated evaluation: the BEST-VALIDATION checkpoint on the official test ----
+    print("\n" + "=" * 60 + "\nFederated Global Model - Official Test Set\n" + "=" * 60)
+    print(f"  Selected best checkpoint: round {best_round} (val macroF1={best_val_f1:.3f})")
+    global_state = best_state
     global_net.load_state_dict(global_state, strict=False)
     fed_m = evaluate(global_net, test_loader, num_classes)
     auc_str = f"{fed_m['auc']:.4f}" if fed_m["auc"] is not None else "n/a"
@@ -778,6 +894,8 @@ def main(args):
             "macro_f1": fed_m["macro_f1"], "auc": fed_m["auc"],
             "per_class_recall": dict(zip(list(attack_enc.classes_), fed_m["per_class_recall"])),
             "num_samples": len(fed_m["yt"]),
+            "selected_round": best_round, "val_macro_f1_at_selection": best_val_f1,
+            "selection": "best validation macro-F1 (official test never used for selection)",
         }), f, indent=2)
     with open("results/baseline_comparison.json", "w") as f:
         json.dump(clean_json({
@@ -801,30 +919,35 @@ def main(args):
     print("\nSaved encoders, scaler, model_config.json, metrics.json, "
           "global_model_metrics.json, baseline_comparison.json")
 
-    # ---- Learning curves (only valid AUCs averaged) ----
-    if allres:
-        rkeys = sorted(allres.keys(), key=lambda s: int(s.replace("Round", "")))
-        accs, mf1s, aucs = [], [], []
-        for rk in rkeys:
-            cm = list(allres[rk].values())
-            accs.append(np.mean([c["acc"] for c in cm]))
-            mf1s.append(np.mean([c["macro_f1"] for c in cm]))
-            valid = [c["auc"] for c in cm if c["auc"] is not None]
-            aucs.append(np.mean(valid) if valid else np.nan)
-        xs = list(range(1, len(rkeys) + 1))
+    # ---- Learning curves: per-round OFFICIAL-test trajectory (the real convergence) ----
+    with open("results/official_trajectory.json", "w") as f:
+        json.dump(clean_json(official_traj), f, indent=2)
+    if official_traj:
+        xs = [t["round"] for t in official_traj]
+        accs = [t["acc"] for t in official_traj]
+        mf1s = [t["macro_f1"] for t in official_traj]
+        aucs = [t["auc"] if t["auc"] is not None else np.nan for t in official_traj]
+        mlp_ref = comparison.get("mlp_flow", {}).get("macro_f1")
         fig, axes = plt.subplots(1, 3, figsize=(16, 5))
         for ax, vals, lab, col in zip(axes, [accs, mf1s, aucs],
                                       ["Accuracy", "Macro F1", "Macro AUC"],
                                       ["steelblue", "darkorange", "green"]):
-            ax.plot(xs, vals, marker="o", color=col, linewidth=2)
-            ax.set_title(f"Avg client {lab} per round")
+            ax.plot(xs, vals, marker="o", color=col, linewidth=2, label="official test")
+            if lab == "Macro F1":
+                ax.plot(xs, [t["val_macro_f1"] for t in official_traj], marker="s",
+                        color="gray", lw=1.5, alpha=0.7, label="validation")
+                if mlp_ref is not None:
+                    ax.axhline(mlp_ref, ls="--", color="crimson", lw=1.5,
+                               label=f"MLP baseline ({mlp_ref:.3f})")
+                ax.legend(loc="lower right", fontsize=8)
+            ax.set_title(f"Official-test {lab} per round")
             ax.set_xlabel("Round"); ax.set_ylabel(lab)
             ax.set_xticks(xs); ax.set_ylim(0, 1.05); ax.grid(True, alpha=0.3)
-        plt.suptitle("Federated Learning Convergence", fontsize=14, fontweight="bold")
+        plt.suptitle("Federated Convergence on Official Test Set", fontsize=14, fontweight="bold")
         plt.tight_layout()
         plt.savefig("results/learning_curves.png", dpi=150)
         plt.close(fig)
-        print("Saved results/learning_curves.png")
+        print("Saved results/learning_curves.png and results/official_trajectory.json")
 
     # ---- Comparison summary ----
     print("\n" + "=" * 60 + "\nMODEL COMPARISON (official test set)\n" + "=" * 60)
@@ -843,16 +966,24 @@ if __name__ == "__main__":
     p.add_argument("--train_csv", default="UNSW_NB15_training-set.csv")
     p.add_argument("--test_csv", default="UNSW_NB15_testing-set.csv")
     p.add_argument("--num_clients", type=int, default=7)
-    p.add_argument("--rounds", type=int, default=10)
-    p.add_argument("--epochs_local", type=int, default=10)
+    p.add_argument("--rounds", type=int, default=12)
+    p.add_argument("--epochs_local", type=int, default=25,
+                   help="max local epochs; early-stop (patience) cuts converged clients short")
     p.add_argument("--hidden_dim", type=int, default=64)
     p.add_argument("--window", type=int, default=256)
     p.add_argument("--knn", type=int, default=5)
     p.add_argument("--fedprox_mu", type=float, default=0.01)
     p.add_argument("--focal_gamma", type=float, default=1.5)
     p.add_argument("--patience", type=int, default=5)
-    p.add_argument("--oversample_floor", type=int, default=1500,
+    p.add_argument("--server_opt", choices=["fedadam", "fedavg"], default="fedadam",
+                   help="server aggregation: persistent FedAdam (default) or plain FedAvg")
+    p.add_argument("--server_lr", type=float, default=0.1, help="FedAdam server learning rate")
+    p.add_argument("--cb_beta", type=float, default=0.999,
+                   help="class-balanced weighting beta (0 -> sqrt inverse-frequency)")
+    p.add_argument("--oversample_floor", type=int, default=800,
                    help="min train rows per class after oversampling (0 disables)")
+    p.add_argument("--val_frac", type=float, default=0.1,
+                   help="fraction of train held out (flow-level) for best-checkpoint selection")
     p.add_argument("--skip_baselines", action="store_true")
     p.add_argument("--log", default=None, help="log file path (default: timestamped)")
     args = p.parse_args()
