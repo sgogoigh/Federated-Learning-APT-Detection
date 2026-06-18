@@ -98,5 +98,31 @@ This document serves as a catalogue of the architectural, programmatic, and pipe
 **Description:** Local training early stopping was based on raw validation accuracy. Because accuracy is heavily dominated by majority classes (Normal/Generic), the local models early-stopped (often at epoch 5) before they could learn minority classes.
 **FIX 16:** Changed the early stopping metric to validation loss, which is smooth and represents true learning progress across all classes. We increased the patience to `5` and adjusted the class weight smoothing factor to a power of `0.6` to give slightly higher weight to minority classes.
 
+---
+
+> **Errors below were encountered during the June 2026 robustness rewrite (`train.py`).**
+
+### PROBLEM NO.17: `.env` Backslash Paths Silently Corrupted by dotenv Escape Parsing
+**Description:** `DATASET_PATH="datasets\mrwellsdavid\unsw-nb15\versions\1\UNSW_NB15_training-set.csv"` parsed to `...unsw-nb15\x0bersions\1\...` because `python-dotenv` interprets C-style escape sequences inside **double-quoted** values: `\v` became a vertical-tab (`\x0b`) and `\1` is also an escape. The path silently pointed nowhere → `FileNotFoundError`. This is distinct from PROBLEM NO.4 (which was about quotes forming an invalid prefix); here the *body* of the path was mangled.
+**FIX 17:** Rewrote `.env` to use **forward slashes** and point to the dataset *directory* (`DATASET_PATH=../datasets/mrwellsdavid/unsw-nb15/versions/1`). Forward slashes work on Windows and contain no escapable characters. Rule of thumb: never put Windows backslash paths inside double-quoted `.env` values.
+
+---
+
+### PROBLEM NO.18: Relative `DATASET_PATH` Not Resolved Against the Right Anchor
+**Description:** The dataset lives at `<project-parent>/datasets/...`, but `train.py` runs from `<project-parent>/Federated-Learning-APT-Detection/`. A relative `DATASET_PATH` joined against `os.getcwd()` resolved to the wrong directory, so the CSV was "not found" even though it existed one level up.
+**FIX 18:** Made `resolve_paths()` try the path against several anchors (cwd, cwd's parent, the script directory and its parent) and, as a final fallback, **recursively `glob`** for the CSV filename under each anchor. The pipeline now finds the dataset regardless of where it is launched from or whether `.env` is correct.
+
+---
+
+### PROBLEM NO.19: `AttributeError: 'list' object has no attribute 'to'` in MLP Baseline Eval
+**Description:** The first full run crashed (exit 1) in `evaluate()`. The graph models yield a PyG `Data` batch (which has `.to(DEVICE)` and `.y`), but the per-flow MLP baseline uses a plain `torch.utils.data.TensorDataset`, whose DataLoader yields a **`[X, y]` list**. The shared `evaluate()` called `batch.to(DEVICE)` unconditionally → `AttributeError`.
+**FIX 19:** Branched both `evaluate()` and `val_macro_f1()` on the `is_graph` flag: graph batches do `batch.to(DEVICE)` / `batch.y`; tensor batches unpack `xb, yb = batch[0].to(DEVICE), batch[1].to(DEVICE)`. Lesson: when one eval helper serves two dataloader types, handle the batch shape explicitly rather than assuming a PyG object.
+
+---
+
+### PROBLEM NO.20: Windows Console `UnicodeEncodeError` Risk on Non-ASCII Log Output
+**Description:** Print strings contained `—` (em-dash) and similar Unicode. The log file opens as UTF-8, but the Windows terminal stream is often cp1252; writing `—` to it can raise `UnicodeEncodeError` and abort a long run mid-training.
+**FIX 20:** Hardened `Logger.write()` to catch `UnicodeEncodeError` and re-encode the message to the terminal's encoding with `errors="replace"` (the UTF-8 log file still gets the original text). Long runs can no longer die on a stray glyph.
+
 
 

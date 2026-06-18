@@ -787,4 +787,111 @@ answers.
 
 ---
 
+# PART III — Deep Plan After the First Honest Run (June 2026)
+
+> Evidence base: `train-logs.txt` (the rewritten pipeline) + `results/baseline_comparison.json`
+> + `REVELATIONS.md` (R1–R7). Read REVELATIONS.md first — this section is the *forward plan*
+> that responds to it.
+
+## 8. Diagnosis in one picture
+
+The first honest run produced **macro-F1 0.386** (federated) on the official test set, *below*
+the **centralized GNN (0.393)** and *below* the **per-flow MLP (0.414)**. The problem decomposes
+into three independent layers, and only the first is about training duration:
+
+| Layer | Symptom | Ceiling it imposes |
+|---|---|---|
+| **L1 Optimization** | Round-2 collapse (macro-F1 0.36→0.21); under-fit early rounds; only 1 early-stop all run; Adam reset every round | Costs ~0.01–0.03 macro-F1 and many wasted rounds |
+| **L2 Representation** | MLP ≥ GNN; kNN graph adds no signal; heavy-tailed features under StandardScaler | Hard cap ≈0.40 macro-F1 |
+| **L3 Data / evaluation** | train→test distribution shift; ultra-rare classes (Worms=44); brute oversampling wrecks precision | Caps rare-class F1 near 0 regardless of L1/L2 |
+
+## 9. The epochs / rounds question — answered with evidence
+
+**The reduced runtime (2m 3s) is real and diagnostic, not a sign the run was skipped.** See
+REVELATIONS R3: only **339 training graphs** exist, batched 8-at-a-time, so the entire 10-round
+federation is ≈2,800 tiny gradient steps over kNN-correlated nodes. The compute is small because
+the *effective sample count* is small.
+
+Verdict (REVELATIONS R5), restated for the plan:
+
+- **Increase local epochs in early rounds → YES, do it.** Round 1 never plateaued (val-loss
+  1.52→0.90 still falling at epoch 10). Concretely: raise `--epochs_local` to ~20–30 *and* let
+  early-stopping (patience already 5) cut it short once a client converges. This extracts more
+  per round and reduces the round-2 re-climb.
+- **Increase rounds → only to ~12–15, then stop.** Local macro-F1 climbed 0.35→0.49 and
+  flattened by round 10; Round 10 was fully plateaued. Extra rounds past convergence buy
+  ~0.01–0.02 at most.
+- **Neither will beat the MLP.** Federated has already reached the centralized ceiling. More
+  optimization budget cannot fix an L2/L3 ceiling. **So: fix L1 cheaply, but spend the real
+  effort on L2 and L3.**
+
+## 10. The plan (prioritized)
+
+### P0-A — Fix the federated optimizer (L1, cheap, do first)
+1. **Stop resetting Adam every round.** Either (a) keep a **server-side optimizer (FedAdam /
+   FedOpt)** that applies the averaged client delta as a "pseudo-gradient" with persistent
+   momentum, or (b) checkpoint and restore each client's optimizer state across rounds. This
+   directly targets the Round-2 collapse and the cold re-climb (R4).
+2. **Adaptive local budget:** `--epochs_local 25` with early-stop patience 5 on val-loss, so
+   under-fit clients train longer and converged clients stop early.
+3. **Strengthen drift control:** sweep `--fedprox_mu` in {0.001, 0.01, 0.1}; 0.01 was too weak to
+   prevent the Round-2 dip.
+4. **Per-round official-test evaluation** (currently only final) so we can *see* the global
+   trajectory instead of inferring it from optimistic client-local curves (R7).
+
+*Expected:* removes the collapse, converges in fewer rounds, nudges federated up to ≈the
+centralized ceiling (~0.39–0.40). Does **not** break the ceiling.
+
+### P0-B — Attack the representation ceiling (L2, the real accuracy lever)
+5. **Build the real host/time communication graph from the raw partitions**
+   (`UNSW-NB15_1..4.csv`, which have `srcip/dstip/sport/dsport/Stime`). Nodes = flows; edges =
+   flows sharing a host within a time window. This is the *only* graph that can plausibly beat
+   the MLP, because it encodes lateral-movement structure the per-flow features cannot. Scaffold:
+   `build_host_time_graphs()`. **Gate:** keep it only if it beats `mlp_flow` macro-F1 (0.414).
+6. **Heavy-tail feature transforms:** apply `log1p` (or sklearn `QuantileTransformer` /
+   `RobustScaler`) to `sbytes,dbytes,sload,dload,rate,dur,*pkts` before scaling. StandardScaler on
+   raw heavy-tailed counts compresses 99% of mass into a sliver — this likely lifts *every* model.
+7. **If 5 fails to beat the MLP, drop the GNN and ship the MLP** as the production detector, and
+   reframe the federation around it (FedAvg works on any model). Honesty over architecture
+   attachment.
+
+### P1 — Rare-class handling that doesn't destroy precision (L3)
+8. **Replace brute oversampling with a two-stage detector:** Stage 1 binary Normal-vs-Attack
+   (both classes huge, easy); Stage 2 fine-grained attack-type only on flows flagged as attacks.
+   This stops Normal from dominating the 10-way loss and isolates rare-class learning.
+9. **Merge or special-case ultra-rare classes:** Worms (44) and Shellcode (378) cannot be learned
+   as full classes from the official train set. Options: fold into a "rare/other-exploit" class,
+   or pull additional Worms/Shellcode rows from the raw partitions to grow real support.
+10. **Per-class threshold calibration** on a validation set instead of relying on oversampling to
+    move decision boundaries (fixes the Worms recall-0.82 / precision-0.02 pathology, R6).
+11. **Try class-balanced focal loss (effective-number weighting)** in place of √-inverse-freq +
+    flat oversampling.
+
+### P1 — Evaluation rigor
+12. **Report macro-F1 and per-class recall/precision as the headline everywhere** (weighted
+    accuracy is a vanity metric here — R1). Keep the baseline comparison table as the primary
+    artifact.
+13. **Quantify the distribution shift:** print train-vs-test class proportions and consider a
+    re-stratified train/val/test split (pooling official train+test then re-splitting) as a
+    second benchmark, reported *alongside* the official split, never instead of it.
+
+### P2 — Scale and search (only after L2/L3 move the ceiling)
+14. More clients (e.g. 10–20) and Dirichlet non-IID partitioning to make the federation a real
+    stress test rather than a 7-way IID toy.
+15. Light hyperparameter sweep (`hidden_dim`, `knn`, `window`, `lr`) — but **only** once the
+    representation is fixed; tuning a capped model is wasted effort.
+
+## 11. What success looks like
+
+- **Primary gate:** federated macro-F1 on the official test set **> 0.414** (beats the MLP). If
+  no configuration clears this, the documented decision is to **ship the MLP** and keep the
+  federation wrapper, not the GNN.
+- **Secondary:** every attack class with ≥1000 train rows reaches recall **>0.5** at precision
+  **>0.4**; ultra-rare classes handled by the two-stage/merge strategy rather than faked by
+  oversampling.
+- **Process:** no Round-2-style collapse in the convergence curve; per-round official-test
+  macro-F1 monotone-ish and plateauing — *visible*, not inferred.
+
+---
+
 *This document is maintained alongside the project and should be updated after each training run.*
