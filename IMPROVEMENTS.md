@@ -698,4 +698,93 @@ Consider running overnight or on a machine with a GPU.
 
 ---
 
+# PART II — Deep Review & Implemented Fixes (June 2026)
+
+> This part supersedes the analysis above. Sections 1–5 reflect an **earlier, abandoned**
+> design (graph-level pooling, KMeans clients, `nrows=5000`, 14 features). The live
+> `train.py` had already moved past most of that (see `ERRORS.md`, fixes 1–16). The
+> review below is against the **actual `train.py`**, and every fix in §7 is implemented.
+
+## 6. What was still wrong with the live `train.py`
+
+After the 16 fixes in `ERRORS.md`, the model no longer collapses to "Normal" — that is
+real progress. But a deeper review found the reported **82.8% accuracy / 0.96 AUC is
+optimistic and not an honest estimate of per-flow detection**, and the APT-relevant rare
+classes score ≈0. Root causes, ranked:
+
+### 6.1 (P0) Graph construction was semantically meaningless and leaked labels
+- Graphs were 120-row windows cut **from the CSV's existing row order**. The
+  training-set CSV has **no timestamp**, so the "temporal chain" edges connected rows
+  that are merely adjacent in a file, not a real network sequence.
+- **Verified against the real file: 56.3% of the 120-row windows are single-class**
+  (avg 3.39 distinct classes/window). Many graphs are near-homogeneous Normal/Generic
+  blobs.
+- GraphSAGE mean-aggregation over a near-single-class blob behaves like **label
+  propagation** — each node "sees" neighbours that almost always share its label, so
+  node-level accuracy looks high without the model learning genuine discrimination. This
+  is why the logs are flooded with `Only one class present in y_true` warnings (whole
+  val/test graphs are one class).
+
+### 6.2 (P0) Rare APT classes structurally could not be learned
+Worms = 44 rows in the entire dataset (< one 120-node graph), Shellcode = 378.
+After 90/10 + 7-way client split + 70/15/15, these vanish from most clients, and
+locally-absent classes got **weight 0.0** (never learned). Result: Shellcode/Worms F1 = 0.
+
+### 6.3 (P1) Preprocessing leakage
+`StandardScaler` and all `LabelEncoder`s were fit on the **entire dataframe before any
+split** — test statistics leaked into training. Doubly wrong for a *federated* setting.
+
+### 6.4 (P1) Evaluation was in-distribution only; AUC misleading
+- "Global test" was a random 10% of the **same training CSV** — the official 175k-row
+  `UNSW_NB15_testing-set.csv` (a true generalization benchmark) was never used.
+- Per-epoch/per-client AUC was `0.000` constantly (single-class loaders), so
+  `learning_curves.png` averaged real values with zeros. Macro-AUC 0.96 sat next to
+  macro-F1 0.45 — technically valid, rhetorically misleading.
+- **No baseline.** Without a non-graph / non-federated comparison, there was no way to
+  tell whether the GNN or the FL added anything over a plain classifier.
+
+### 6.5 (P1) Tiny, high-variance federation
+687 graphs → ~62 train graphs/client. Plain **unweighted** FedAvg over such small, noisy
+partitions with 10 local epochs invites client drift (client test acc swung 0.48→0.92).
+
+### 6.6 (P2) Reproducibility / hygiene
+Hardcoded absolute CSV path overrode `--csv`/`.env`; the log file was truncated on every
+import; `forward()` hardcoded the `:39` continuous/categorical split.
+
+---
+
+## 7. Implemented Fixes (all live in `train.py`)
+
+| # | Fix | Addresses | Where |
+|---|---|---|---|
+| F1 | **Train-only preprocessing.** Scaler + proto/service/state/attack encoders are `fit` on train flows only and *applied* to test (unseen categoricals → `<unknown>`). | 6.3 | `fit_preprocessor()`, `transform_df()` |
+| F2 | **Honest held-out benchmark.** Loads the official `UNSW_NB15_testing-set.csv` as the final test set; all headline numbers are computed there, never on a slice of the training CSV. | 6.4 | `resolve_paths()`, `main()` |
+| F3 | **Non-leaking similarity graphs.** Rows are **shuffled** before windowing (kills the CSV-order artifact) and the bogus temporal-chain edge is removed; edges are pure **kNN on scaled continuous features**. Train and test graphs are built from disjoint CSVs, so neighbour-homophily is legitimate signal, not leakage. | 6.1 | `build_graphs()` |
+| F4 | **Minority oversampling.** Lightweight random oversampling with Gaussian jitter on scaled features raises every train class to a floor (default 1500) before graph building — Worms 44→1500, etc. Test set is left at its real distribution. (No `imbalanced-learn` dependency.) | 6.2 | `oversample_minorities()` |
+| F5 | **Focal loss + safe class weights.** `√`-smoothed inverse-frequency `alpha`; absent-class weight set to the mean (neutral) instead of 0; focal `(1-p)^γ` factor focuses learning on hard/rare classes. | 6.2 | `FocalLoss`, `class_alpha()` |
+| F6 | **Stratified, IID client partitioning** of shuffled multi-class graphs so every client sees every class. | 6.2/6.5 | `create_clients()` |
+| F7 | **Sample-weighted FedAvg + FedProx.** Aggregation is weighted by each client's train-node count; a FedProx proximal term (`μ‖w−w_global‖²`, default μ=0.01) curbs client drift. | 6.5 | `fedavg()`, `train_local()` |
+| F8 | **Robust metrics.** Per-class macro-F1 and per-class recall are the headline; AUC is computed per-present-class via `label_binarize` (no spam, no zero-padding); learning curves average only valid AUCs. | 6.4 | `safe_macro_auc()`, `evaluate()` |
+| F9 | **Honest baselines.** Two reference models trained centrally and scored on the same official test set: (a) a **per-flow MLP** (same embeddings, no graph) → isolates "does the graph help?"; (b) a **centralized GraphSAGE** (no FL) → isolates "what does federation cost?". Saved to `results/baseline_comparison.json`. | 6.4 | `train_mlp_baseline()`, `train_centralized_gnn()` |
+| F10 | **Reproducibility/hygiene.** No hardcoded paths (resolved from `--train_csv`/`--test_csv` + `.env`); timestamped log file; `continuous_dim` is config-driven, not a magic `39`. | 6.6 | `main()`, `GraphSAGEClassifier` |
+
+### Caveat — the IP/time "communication graph" (recommended next step, not yet wired in)
+A *truly* meaningful APT graph connects flows that share a host within a time window —
+which needs `srcip/dstip/Stime`. Those columns exist only in the **raw** partition files
+(`UNSW-NB15_1..4.csv`, 49 cols), and the official train/test sets deliberately strip them.
+Because F2's fair benchmark depends on the official split, the live pipeline ships the
+**non-leaking feature-similarity graph (F3)** plus the **baselines (F9)** — which is what
+actually answers *"is the graph worth it?"*. A `build_host_time_graphs()` scaffold over the
+raw files is documented here as the next experiment; promote it once the baseline shows the
+graph earning its keep.
+
+### How to read the new output
+`results/baseline_comparison.json` is now the primary artifact. Compare **macro-F1** and
+**per-class recall** across `mlp_flow`, `centralized_gnn`, and `federated_gnn` on the
+official test set. If `federated_gnn` ≈ `mlp_flow`, the graph/FL machinery is not earning
+its complexity and should be reconsidered — that is the honest question this pipeline now
+answers.
+
+---
+
 *This document is maintained alongside the project and should be updated after each training run.*

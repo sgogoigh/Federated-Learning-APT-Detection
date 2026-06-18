@@ -30,3 +30,6 @@ python-dotenv
 
 # Kaggle
 kagglehub
+
+# Sampling methods
+imblearn
