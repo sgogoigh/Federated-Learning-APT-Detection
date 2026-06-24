@@ -176,4 +176,53 @@ reason a *re-stratified* benchmark (IMPROVEMENTS Part III #13) should be reporte
 
 ---
 
+# Run 3 — LANL lateral-movement detection (the pivot pays off, June 2026)
+
+> First federated GNN run on LANL authentication graphs (days 0–15, hourly snapshots, edge-level
+> red-team detection). Temporal split: train days 0–10, test days 11–15. Test = **217 malicious
+> edges among 5,376,274** (base rate 4.0×10⁻⁵). Metric suite = ROC-AUC, PR-AUC, detection@FPR.
+
+| model | ROC-AUC | PR-AUC | TPR@FPR=1% | TPR@FPR=0.1% | TPR@FPR=0.01% |
+|---|---|---|---|---|---|
+| no-graph MLP | 0.911 | 0.013 | 0.470 | 0.336 | 0.032 |
+| centralized GNN | **0.990** | 0.060 | 0.972 | 0.618 | 0.290 |
+| federated GNN | 0.981 | **0.117** | 0.945 | **0.788** | 0.295 |
+
+## R13 — The graph finally earns its place (the core publishable finding)
+
+Unlike UNSW-NB15 (where GNN ≈ MLP, R10), on LANL the GNN **massively beats** the no-graph
+baseline: ROC-AUC 0.99 vs 0.91, PR-AUC 0.060 vs 0.013 (**4.6×**), TPR@0.1%FPR 0.62 vs 0.34. This
+is the whole thesis made empirical: **lateral movement is a graph property** — a single logon looks
+benign; the malicious signal is in the connectivity pattern, which only message passing can see.
+A non-graph model is structurally blind to it. *This* is the contribution UNSW-NB15 could never
+provide.
+
+## R14 — Federation does not hurt — and here it helped detection
+
+The federated GNN matches the centralized one on ROC-AUC (0.981 vs 0.990) and is actually
+**better on the operational metrics** — PR-AUC 0.117 vs 0.060 and TPR@0.1%FPR **0.788 vs 0.618**.
+Best-val checkpointing (round 9) likely acted as regularization the fixed-epoch centralized run
+didn't get; treat the *direction* cautiously pending multi-seed (R11), but the safe, strong claim
+holds: **privacy-preserving FedAdam federation reaches centralized-grade lateral-movement detection
+without sharing raw auth logs.** That is a legitimate FL contribution.
+
+## R15 — The operational number is the story, not PR-AUC's absolute value
+
+At a 4×10⁻⁵ base rate, PR-AUC 0.117 is ~2,900× random — but the line that lands in a paper/SOC is
+**"detects 79% of red-team lateral-movement authentications at a 0.1% false-positive rate"**
+(94% at 1% FPR). That is a genuinely strong, deployable operating point and the right way to report
+this task. Accuracy/F1 would have been meaningless here (predict-all-benign = 99.996% accurate).
+
+## R16 — Healthy convergence, but val→test gap and remaining caveats
+
+Val PR-AUC climbed smoothly to a round-9 peak (0.223 → test 0.117) with no collapse (FedAdam +
+shared init working as on UNSW). Caveats for the paper, all addressable: (a) the val→test PR-AUC gap
+(~0.22→0.12) means selection is still noisy with ~36 val positives; (b) the federation is currently
+**IID over time-snapshots** (round-robin), not the non-IID-by-host/domain partition the FL story
+needs — LANL is single-domain (DOM1), so cross-org must be *simulated* by host-community partition;
+(c) single seed — multi-seed mean±std required before the federated>centralized claim is trustworthy;
+(d) only days 0–15 of 58 used.
+
+---
+
 *Living document. Append a new R-entry after every substantive run.*

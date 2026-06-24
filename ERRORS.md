@@ -124,5 +124,13 @@ This document serves as a catalogue of the architectural, programmatic, and pipe
 **Description:** Print strings contained `—` (em-dash) and similar Unicode. The log file opens as UTF-8, but the Windows terminal stream is often cp1252; writing `—` to it can raise `UnicodeEncodeError` and abort a long run mid-training.
 **FIX 20:** Hardened `Logger.write()` to catch `UnicodeEncodeError` and re-encode the message to the terminal's encoding with `errors="replace"` (the UTF-8 log file still gets the original text). Long runs can no longer die on a stray glyph.
 
+---
+
+> **Errors below were encountered during the June 2026 LANL pivot (`lanl_prep.py`).**
+
+### PROBLEM NO.21: LANL `auth.txt` LogOn Filter Used the Wrong Column → 0 Graphs Built
+**Description:** `lanl_prep.py` filtered authentication events to logons with `if p[6] != "LogOn": continue`. But in the LANL `auth.txt` schema, column 6 is `logon_type` (values `Network`, `Interactive`, `Batch`, `Service`, …) — it is **never** `"LogOn"`. The LogOn/LogOff value lives in column 7 (`auth_orientation`). The filter therefore dropped **every** event, and a 1-day prototype run "built 0 snapshots | edges=0". The bug hid behind a self-test that used unrealistic synthetic rows (it put `"LogOn"` in column 6), so the self-test passed while real data produced nothing.
+**FIX 21:** Filter on `p[7]` (`auth_orientation == "LogOn"`) instead of `p[6]`, and rewrote the self-test rows to use realistic field values (`logon_type` ∈ {Network, Interactive}, `auth_orientation` ∈ {LogOn, LogOff}) with a LogOff row that must be filtered — so the self-test now actually exercises the real filter semantics. Lesson: synthetic fixtures must mirror the real schema's *values*, not just its column count, or they validate nothing.
+
 
 

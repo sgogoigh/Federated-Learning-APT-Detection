@@ -926,4 +926,129 @@ REVELATIONS R8–R12):
 
 ---
 
+# PART IV — Strategic Pivot to a Graph-Native APT Dataset (LANL) for Publication
+
+> Decision (June 2026): UNSW-NB15 has been pushed to its honest ceiling (macro-F1 ≈0.39,
+> GNN ≈ MLP) and, more fundamentally, **is not an APT dataset** — it is per-flow NIDS data with
+> no lateral-movement structure, so a graph adds nothing and the "APT" claim is indefensible to
+> reviewers. To produce a publishable contribution we move to the **LANL Comprehensive,
+> Multi-Source Cyber-Security Events** dataset, where the graph is intrinsic and APT labels are
+> real. UNSW-NB15 work is retained as a secondary NIDS baseline / sanity check.
+
+## 13. Why LANL fixes all three blockers at once
+
+| Blocker (Part III) | How LANL resolves it |
+|---|---|
+| Graph is meaningless | Authentication events are **directed computer→computer edges** — a real enterprise network graph. Message passing now models lateral movement, the actual APT signal. |
+| "APT" claim is false | `redteam.txt` contains **749 ground-truth red-team compromise events** (ATT&CK-style lateral movement) — genuine APT labels, not synthesized attack categories. |
+| No contribution (GNN≈MLP) | Graph structure is the *only* way to detect lateral movement (a single auth looks benign; the **path** is malicious). Non-graph baselines are expected to lose — giving the GNN a real reason to exist. The federated angle (cross-domain, privacy-preserving lateral-movement detection) is under-explored on LANL. |
+
+## 14. Dataset
+
+**LANL "Comprehensive, Multi-Source Cyber-Security Events" (Kent, 2015)** — `csr.lanl.gov/data/cyber1/`.
+58 days, one enterprise network. Files (data-fence gated, signed URLs):
+
+| File | Schema | Role |
+|---|---|---|
+| `auth.txt.gz` (~9 GB gz, 1.05 B rows) | `time, src_user@dom, dst_user@dom, src_comp, dst_comp, auth_type, logon_type, auth_orientation, success/fail` | The authentication graph edges. |
+| `redteam.txt.gz` (~20 KB, 749 rows) | `time, user@dom, src_comp, dst_comp` | **Ground-truth malicious auth events** (APT labels). |
+| `proc.txt.gz`, `flows.txt.gz`, `dns.txt.gz` | (optional) | Multi-modal node/edge features for a richer model later. |
+
+**Reality of the label:** 749 malicious among ~1.05 B events (≈7×10⁻⁷). This is an extreme
+**anomaly-detection / rare-event** problem, not a balanced classifier. Evaluation must reflect that
+(§17).
+
+## 15. Task definition
+
+**Primary task — edge-level malicious-authentication detection (lateral movement).**
+Given a time-windowed authentication graph, classify each auth edge (or (src→dst, window) pair) as
+benign vs red-team. This is the faithful match to `redteam.txt`'s granularity and the standard LANL
+framing (cf. Bowman et al.; King & Huang "Euler"; Kent's own baselines).
+
+Secondary framings to report: node/host-window compromise classification; unsupervised anomaly
+scoring (autoencoder/GNN reconstruction) for a label-free baseline.
+
+## 16. Graph construction (`lanl_prep.py`)
+
+1. **Stream** `auth.txt.gz` line-by-line (never decompress fully); keep only events in a configurable
+   time window `[t_start, t_end]` and, optionally, logon-type events (`LogOn`, network logons) which
+   is where red-team activity lives.
+2. **Bucket** into snapshots of `Δt` (e.g., hourly or daily). Each snapshot → one graph.
+3. **Nodes** = computers (optionally also users, as a bipartite/heterogeneous graph later). **Edges** =
+   directed `src_comp → dst_comp` auth events aggregated within the bucket.
+4. **Edge features**: event count, success/fail counts & ratio, #distinct users, #distinct auth types,
+   one-hot of dominant auth/logon type, off-hours flag, src/dst out/in-degree, novelty (first-time
+   src→dst pair) — the features that distinguish lateral movement from routine logons.
+5. **Labels**: an edge is malicious if `(time≈bucket, user, src_comp, dst_comp)` matches a `redteam`
+   tuple (join on src/dst computer within the bucket's time span). Propagate to node-window labels if
+   needed.
+6. **Benign downsampling** (train only): keep ALL malicious edges; subsample benign edges/graphs to a
+   tractable ratio (e.g., 1:100–1:1000), and **state the ratio** — never touch the test window's
+   distribution.
+7. Output PyG snapshot graphs to disk (`results/lanl_graphs/`), plus a manifest with counts.
+
+## 17. Evaluation (this is where the paper is won or lost)
+
+Accuracy / macro-F1 are meaningless at 7×10⁻⁷ prevalence. Report the rare-event suite:
+- **ROC-AUC** and especially **PR-AUC / Average Precision** (the honest metric under extreme imbalance).
+- **Detection rate (recall) at fixed low false-positive budgets** — e.g., TPR @ FPR=10⁻³, 10⁻⁴; and
+  **precision@k / alerts-per-day** an analyst could triage. This is the operationally meaningful number.
+- **Temporal split**: train on early days, test on later days containing held-out red-team events —
+  no shuffling across time (prevents leakage; mirrors deployment).
+- Multi-seed mean ± std (R11).
+
+## 18. Federated design (the novelty lever)
+
+- **Partition by domain / host community** (natural organizational units) → realistic **non-IID**
+  federation, not the UNSW toy IID round-robin. Use the existing `ServerOpt` (FedAdam) machinery.
+- **Contribution angles** (pick/sharpen one): privacy-preserving *cross-organization* lateral-movement
+  detection (no enterprise shares raw auth logs); non-IID robustness of FedAdam vs FedAvg on a real
+  topology; communication-efficiency; optional differential-privacy on shared updates with a utility
+  curve.
+
+## 19. Baselines (mandatory, same temporal split)
+Logistic regression / XGBoost on edge features (no graph); node2vec/DeepWalk + classifier; an
+unsupervised anomaly baseline; centralized GNN; and ≥1 prior published LANL lateral-movement method.
+The GNN must beat the non-graph baselines on PR-AUC and detection@FPR — that is the paper's claim.
+
+## 20. Realistic targets
+Published LANL lateral-movement detectors report **ROC-AUC ≈0.95–0.99**; the differentiator is
+**PR-AUC and detection@low-FPR** (often AP in the 0.1–0.6 range depending on setup — high relative to a
+7×10⁻⁷ base rate). A federated model that approaches the centralized GNN's detection@FPR while
+preserving privacy is a legitimate, publishable result.
+
+## 21. Build stages (status)
+1. **`lanl_prep.py`** — streaming ingest + windowed auth-graph construction + redteam edge labels,
+   with a `--selftest` on synthetic LANL-format data. ✅ **done & tested.**
+2. **Data acquisition** — `auth.txt.gz` (7.2 GB) + `redteam.txt.gz` (749 events) in `datasets/`.
+   ✅ **done.** Built 384 hourly snapshots, days 0–15, 16.0 M edges, 457 malicious (`datasets/lanl_graphs/`).
+3. **`train_lanl.py`** — federated edge classifier (GraphSAGE node embeddings → edge MLP), negative
+   sampling, FedAdam, best-by-val (PR-AUC) checkpoint, rare-event metric suite, + no-graph and
+   centralized baselines. ✅ **done & run** (see REVELATIONS R13–R16).
+4. **Baselines + ablations + multi-seed** per §19/§17. *(partial — no-graph + centralized baselines
+   done; multi-seed and ablations pending).*
+
+## 22. Run 1 result & the road to a paper
+
+**Headline (official temporal test split, 217 mal / 5.38 M edges):** federated GNN **ROC-AUC 0.981,
+detects 79% of red-team logons @ 0.1% FPR**; GNN ≫ no-graph baseline (PR-AUC 4.6×); federation ≈/≥
+centralized. The graph and the federation both now earn their place — the contribution UNSW-NB15
+could not support.
+
+**To make it publishable, in priority order:**
+1. **Non-IID-by-host partition** (§18). Replace round-robin-over-snapshots with a host-community
+   partition (cluster computers; each client owns a host set) to simulate cross-organization
+   federation — the actual FL novelty. Report non-IID robustness (FedAdam vs FedAvg).
+2. **Multi-seed mean ± std** (≥3–5 seeds) for every model; the federated>centralized claim needs
+   error bars (R14/R11).
+3. **Stronger / more baselines** (§19): logistic regression & XGBoost on edge features, node2vec, and
+   ≥1 prior published LANL lateral-movement method, all on the identical split.
+4. **Scale & ablate**: more days (toward full 58), daily vs hourly snapshots, temporal node identity
+   across snapshots, edge-feature ablation, FPR-budget sweep.
+5. **Tighten selection**: larger/again-stratified val or smoothed selection to close the val→test
+   PR-AUC gap (R16).
+6. *(optional)* differential-privacy on shared updates with a utility curve, for the privacy claim.
+
+---
+
 *This document is maintained alongside the project and should be updated after each training run.*
