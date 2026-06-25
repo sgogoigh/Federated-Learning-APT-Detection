@@ -698,4 +698,372 @@ Consider running overnight or on a machine with a GPU.
 
 ---
 
+# PART II — Deep Review & Implemented Fixes (June 2026)
+
+> This part supersedes the analysis above. Sections 1–5 reflect an **earlier, abandoned**
+> design (graph-level pooling, KMeans clients, `nrows=5000`, 14 features). The live
+> `train.py` had already moved past most of that (see `ERRORS.md`, fixes 1–16). The
+> review below is against the **actual `train.py`**, and every fix in §7 is implemented.
+
+## 6. What was still wrong with the live `train.py`
+
+After the 16 fixes in `ERRORS.md`, the model no longer collapses to "Normal" — that is
+real progress. But a deeper review found the reported **82.8% accuracy / 0.96 AUC is
+optimistic and not an honest estimate of per-flow detection**, and the APT-relevant rare
+classes score ≈0. Root causes, ranked:
+
+### 6.1 (P0) Graph construction was semantically meaningless and leaked labels
+- Graphs were 120-row windows cut **from the CSV's existing row order**. The
+  training-set CSV has **no timestamp**, so the "temporal chain" edges connected rows
+  that are merely adjacent in a file, not a real network sequence.
+- **Verified against the real file: 56.3% of the 120-row windows are single-class**
+  (avg 3.39 distinct classes/window). Many graphs are near-homogeneous Normal/Generic
+  blobs.
+- GraphSAGE mean-aggregation over a near-single-class blob behaves like **label
+  propagation** — each node "sees" neighbours that almost always share its label, so
+  node-level accuracy looks high without the model learning genuine discrimination. This
+  is why the logs are flooded with `Only one class present in y_true` warnings (whole
+  val/test graphs are one class).
+
+### 6.2 (P0) Rare APT classes structurally could not be learned
+Worms = 44 rows in the entire dataset (< one 120-node graph), Shellcode = 378.
+After 90/10 + 7-way client split + 70/15/15, these vanish from most clients, and
+locally-absent classes got **weight 0.0** (never learned). Result: Shellcode/Worms F1 = 0.
+
+### 6.3 (P1) Preprocessing leakage
+`StandardScaler` and all `LabelEncoder`s were fit on the **entire dataframe before any
+split** — test statistics leaked into training. Doubly wrong for a *federated* setting.
+
+### 6.4 (P1) Evaluation was in-distribution only; AUC misleading
+- "Global test" was a random 10% of the **same training CSV** — the official 175k-row
+  `UNSW_NB15_testing-set.csv` (a true generalization benchmark) was never used.
+- Per-epoch/per-client AUC was `0.000` constantly (single-class loaders), so
+  `learning_curves.png` averaged real values with zeros. Macro-AUC 0.96 sat next to
+  macro-F1 0.45 — technically valid, rhetorically misleading.
+- **No baseline.** Without a non-graph / non-federated comparison, there was no way to
+  tell whether the GNN or the FL added anything over a plain classifier.
+
+### 6.5 (P1) Tiny, high-variance federation
+687 graphs → ~62 train graphs/client. Plain **unweighted** FedAvg over such small, noisy
+partitions with 10 local epochs invites client drift (client test acc swung 0.48→0.92).
+
+### 6.6 (P2) Reproducibility / hygiene
+Hardcoded absolute CSV path overrode `--csv`/`.env`; the log file was truncated on every
+import; `forward()` hardcoded the `:39` continuous/categorical split.
+
+---
+
+## 7. Implemented Fixes (all live in `train.py`)
+
+| # | Fix | Addresses | Where |
+|---|---|---|---|
+| F1 | **Train-only preprocessing.** Scaler + proto/service/state/attack encoders are `fit` on train flows only and *applied* to test (unseen categoricals → `<unknown>`). | 6.3 | `fit_preprocessor()`, `transform_df()` |
+| F2 | **Honest held-out benchmark.** Loads the official `UNSW_NB15_testing-set.csv` as the final test set; all headline numbers are computed there, never on a slice of the training CSV. | 6.4 | `resolve_paths()`, `main()` |
+| F3 | **Non-leaking similarity graphs.** Rows are **shuffled** before windowing (kills the CSV-order artifact) and the bogus temporal-chain edge is removed; edges are pure **kNN on scaled continuous features**. Train and test graphs are built from disjoint CSVs, so neighbour-homophily is legitimate signal, not leakage. | 6.1 | `build_graphs()` |
+| F4 | **Minority oversampling.** Lightweight random oversampling with Gaussian jitter on scaled features raises every train class to a floor (default 1500) before graph building — Worms 44→1500, etc. Test set is left at its real distribution. (No `imbalanced-learn` dependency.) | 6.2 | `oversample_minorities()` |
+| F5 | **Focal loss + safe class weights.** `√`-smoothed inverse-frequency `alpha`; absent-class weight set to the mean (neutral) instead of 0; focal `(1-p)^γ` factor focuses learning on hard/rare classes. | 6.2 | `FocalLoss`, `class_alpha()` |
+| F6 | **Stratified, IID client partitioning** of shuffled multi-class graphs so every client sees every class. | 6.2/6.5 | `create_clients()` |
+| F7 | **Sample-weighted FedAvg + FedProx.** Aggregation is weighted by each client's train-node count; a FedProx proximal term (`μ‖w−w_global‖²`, default μ=0.01) curbs client drift. | 6.5 | `fedavg()`, `train_local()` |
+| F8 | **Robust metrics.** Per-class macro-F1 and per-class recall are the headline; AUC is computed per-present-class via `label_binarize` (no spam, no zero-padding); learning curves average only valid AUCs. | 6.4 | `safe_macro_auc()`, `evaluate()` |
+| F9 | **Honest baselines.** Two reference models trained centrally and scored on the same official test set: (a) a **per-flow MLP** (same embeddings, no graph) → isolates "does the graph help?"; (b) a **centralized GraphSAGE** (no FL) → isolates "what does federation cost?". Saved to `results/baseline_comparison.json`. | 6.4 | `train_mlp_baseline()`, `train_centralized_gnn()` |
+| F10 | **Reproducibility/hygiene.** No hardcoded paths (resolved from `--train_csv`/`--test_csv` + `.env`); timestamped log file; `continuous_dim` is config-driven, not a magic `39`. | 6.6 | `main()`, `GraphSAGEClassifier` |
+
+### Caveat — the IP/time "communication graph" (recommended next step, not yet wired in)
+A *truly* meaningful APT graph connects flows that share a host within a time window —
+which needs `srcip/dstip/Stime`. Those columns exist only in the **raw** partition files
+(`UNSW-NB15_1..4.csv`, 49 cols), and the official train/test sets deliberately strip them.
+Because F2's fair benchmark depends on the official split, the live pipeline ships the
+**non-leaking feature-similarity graph (F3)** plus the **baselines (F9)** — which is what
+actually answers *"is the graph worth it?"*. A `build_host_time_graphs()` scaffold over the
+raw files is documented here as the next experiment; promote it once the baseline shows the
+graph earning its keep.
+
+### How to read the new output
+`results/baseline_comparison.json` is now the primary artifact. Compare **macro-F1** and
+**per-class recall** across `mlp_flow`, `centralized_gnn`, and `federated_gnn` on the
+official test set. If `federated_gnn` ≈ `mlp_flow`, the graph/FL machinery is not earning
+its complexity and should be reconsidered — that is the honest question this pipeline now
+answers.
+
+---
+
+# PART III — Deep Plan After the First Honest Run (June 2026)
+
+> Evidence base: `train-logs.txt` (the rewritten pipeline) + `results/baseline_comparison.json`
+> + `REVELATIONS.md` (R1–R7). Read REVELATIONS.md first — this section is the *forward plan*
+> that responds to it.
+
+## 8. Diagnosis in one picture
+
+The first honest run produced **macro-F1 0.386** (federated) on the official test set, *below*
+the **centralized GNN (0.393)** and *below* the **per-flow MLP (0.414)**. The problem decomposes
+into three independent layers, and only the first is about training duration:
+
+| Layer | Symptom | Ceiling it imposes |
+|---|---|---|
+| **L1 Optimization** | Round-2 collapse (macro-F1 0.36→0.21); under-fit early rounds; only 1 early-stop all run; Adam reset every round | Costs ~0.01–0.03 macro-F1 and many wasted rounds |
+| **L2 Representation** | MLP ≥ GNN; kNN graph adds no signal; heavy-tailed features under StandardScaler | Hard cap ≈0.40 macro-F1 |
+| **L3 Data / evaluation** | train→test distribution shift; ultra-rare classes (Worms=44); brute oversampling wrecks precision | Caps rare-class F1 near 0 regardless of L1/L2 |
+
+## 9. The epochs / rounds question — answered with evidence
+
+**The reduced runtime (2m 3s) is real and diagnostic, not a sign the run was skipped.** See
+REVELATIONS R3: only **339 training graphs** exist, batched 8-at-a-time, so the entire 10-round
+federation is ≈2,800 tiny gradient steps over kNN-correlated nodes. The compute is small because
+the *effective sample count* is small.
+
+Verdict (REVELATIONS R5), restated for the plan:
+
+- **Increase local epochs in early rounds → YES, do it.** Round 1 never plateaued (val-loss
+  1.52→0.90 still falling at epoch 10). Concretely: raise `--epochs_local` to ~20–30 *and* let
+  early-stopping (patience already 5) cut it short once a client converges. This extracts more
+  per round and reduces the round-2 re-climb.
+- **Increase rounds → only to ~12–15, then stop.** Local macro-F1 climbed 0.35→0.49 and
+  flattened by round 10; Round 10 was fully plateaued. Extra rounds past convergence buy
+  ~0.01–0.02 at most.
+- **Neither will beat the MLP.** Federated has already reached the centralized ceiling. More
+  optimization budget cannot fix an L2/L3 ceiling. **So: fix L1 cheaply, but spend the real
+  effort on L2 and L3.**
+
+## 10. The plan (prioritized)
+
+### P0-A — Fix the federated optimizer (L1, cheap, do first)
+1. **Stop resetting Adam every round.** Either (a) keep a **server-side optimizer (FedAdam /
+   FedOpt)** that applies the averaged client delta as a "pseudo-gradient" with persistent
+   momentum, or (b) checkpoint and restore each client's optimizer state across rounds. This
+   directly targets the Round-2 collapse and the cold re-climb (R4).
+2. **Adaptive local budget:** `--epochs_local 25` with early-stop patience 5 on val-loss, so
+   under-fit clients train longer and converged clients stop early.
+3. **Strengthen drift control:** sweep `--fedprox_mu` in {0.001, 0.01, 0.1}; 0.01 was too weak to
+   prevent the Round-2 dip.
+4. **Per-round official-test evaluation** (currently only final) so we can *see* the global
+   trajectory instead of inferring it from optimistic client-local curves (R7).
+
+*Expected:* removes the collapse, converges in fewer rounds, nudges federated up to ≈the
+centralized ceiling (~0.39–0.40). Does **not** break the ceiling.
+
+### P0-B — Attack the representation ceiling (L2, the real accuracy lever)
+5. **Build the real host/time communication graph from the raw partitions**
+   (`UNSW-NB15_1..4.csv`, which have `srcip/dstip/sport/dsport/Stime`). Nodes = flows; edges =
+   flows sharing a host within a time window. This is the *only* graph that can plausibly beat
+   the MLP, because it encodes lateral-movement structure the per-flow features cannot. Scaffold:
+   `build_host_time_graphs()`. **Gate:** keep it only if it beats `mlp_flow` macro-F1 (0.414).
+6. **Heavy-tail feature transforms:** apply `log1p` (or sklearn `QuantileTransformer` /
+   `RobustScaler`) to `sbytes,dbytes,sload,dload,rate,dur,*pkts` before scaling. StandardScaler on
+   raw heavy-tailed counts compresses 99% of mass into a sliver — this likely lifts *every* model.
+7. **If 5 fails to beat the MLP, drop the GNN and ship the MLP** as the production detector, and
+   reframe the federation around it (FedAvg works on any model). Honesty over architecture
+   attachment.
+
+### P1 — Rare-class handling that doesn't destroy precision (L3)
+8. **Replace brute oversampling with a two-stage detector:** Stage 1 binary Normal-vs-Attack
+   (both classes huge, easy); Stage 2 fine-grained attack-type only on flows flagged as attacks.
+   This stops Normal from dominating the 10-way loss and isolates rare-class learning.
+9. **Merge or special-case ultra-rare classes:** Worms (44) and Shellcode (378) cannot be learned
+   as full classes from the official train set. Options: fold into a "rare/other-exploit" class,
+   or pull additional Worms/Shellcode rows from the raw partitions to grow real support.
+10. **Per-class threshold calibration** on a validation set instead of relying on oversampling to
+    move decision boundaries (fixes the Worms recall-0.82 / precision-0.02 pathology, R6).
+11. **Try class-balanced focal loss (effective-number weighting)** in place of √-inverse-freq +
+    flat oversampling.
+
+### P1 — Evaluation rigor
+12. **Report macro-F1 and per-class recall/precision as the headline everywhere** (weighted
+    accuracy is a vanity metric here — R1). Keep the baseline comparison table as the primary
+    artifact.
+13. **Quantify the distribution shift:** print train-vs-test class proportions and consider a
+    re-stratified train/val/test split (pooling official train+test then re-splitting) as a
+    second benchmark, reported *alongside* the official split, never instead of it.
+
+### P2 — Scale and search (only after L2/L3 move the ceiling)
+14. More clients (e.g. 10–20) and Dirichlet non-IID partitioning to make the federation a real
+    stress test rather than a 7-way IID toy.
+15. Light hyperparameter sweep (`hidden_dim`, `knn`, `window`, `lr`) — but **only** once the
+    representation is fixed; tuning a capped model is wasted effort.
+
+## 11. What success looks like
+
+- **Primary gate:** federated macro-F1 on the official test set **> 0.414** (beats the MLP). If
+  no configuration clears this, the documented decision is to **ship the MLP** and keep the
+  federation wrapper, not the GNN.
+- **Secondary:** every attack class with ≥1000 train rows reaches recall **>0.5** at precision
+  **>0.4**; ultra-rare classes handled by the two-stage/merge strategy rather than faked by
+  oversampling.
+- **Process:** no Round-2-style collapse in the convergence curve; per-round official-test
+  macro-F1 monotone-ish and plateauing — *visible*, not inferred.
+
+## 12. Implementation status — Run 2 (June 2026)
+
+What from §10 is now **implemented in `train.py`** and verified by a full run (see
+REVELATIONS R8–R12):
+
+| Plan item | Status | Result |
+|---|---|---|
+| P0-A #1 Server optimizer (FedAdam/FedOpt, persistent momentum, shared init) | ✅ done | `ServerOpt` class; `--server_opt`/`--server_lr`. Killed the Round-2 collapse (R8). |
+| P0-A #2 Adaptive local epochs (25, patience 5) | ✅ done | 44 early-stops vs 1; under-fitting cured (R8). |
+| P0-A #3 FedProx tunable | ✅ exposed | `--fedprox_mu` (default 0.01). Sweep still pending. |
+| P0-A #4 Per-round official-test eval + trajectory | ✅ done | `results/official_trajectory.json` + `learning_curves.png` (val vs test vs MLP line). |
+| P0-B #6 Heavy-tail feature transform | ✅ done | `_signed_log1p` lifted every model's floor (R9). |
+| P1 #11 Class-balanced focal weights | ✅ done | `cb_alpha` (`--cb_beta`); oversample floor lowered 1500→800. |
+| (new) Best-by-**validation** checkpointing | ✅ done | flow-level val split before oversampling; official test never used for selection (R12). |
+| P1 #12 macro-F1 / per-class headline | ✅ done | Headline everywhere; weighted-acc demoted. |
+| P1 #13 Distribution-shift print | ✅ done | train%→test% table at startup. |
+
+**Outcome:** federation reached parity with the centralized GNN and the MLP at macro-F1 ≈0.39
+(R9). **Optimization is no longer the bottleneck — the representational ceiling is (R10).**
+
+### Still open (the real accuracy levers — next chunk)
+- **P0-B #5 — host/time communication graph from the raw partitions** (`UNSW-NB15_1..4.csv`).
+  This is now the highest-priority item: the only change that can plausibly push the GNN past
+  the MLP. Until it lands, the GNN is not justified over the simpler MLP.
+- **P1 #8/#9/#10 — rare-class strategy**: two-stage (binary → fine-grained) detector; merge or
+  source-more-data for Worms/Shellcode; per-class threshold calibration. The current run still
+  shows Analysis/Backdoor ≈0 F1 and Worms over-triggered (recall 0.74 / precision 0.02).
+- **Multi-seed evaluation** (R11): report mean ± std over ≥3 seeds before trusting any
+  model-vs-model ranking; single runs swing ~0.03–0.04 macro-F1.
+- **P0-A #3 / server_lr sweep**: the official-test trajectory still oscillates ±0.05 round-to-
+  round; tune `--server_lr` (try 0.05) and `--fedprox_mu`, or add server-LR decay.
+
+---
+
+# PART IV — Strategic Pivot to a Graph-Native APT Dataset (LANL) for Publication
+
+> Decision (June 2026): UNSW-NB15 has been pushed to its honest ceiling (macro-F1 ≈0.39,
+> GNN ≈ MLP) and, more fundamentally, **is not an APT dataset** — it is per-flow NIDS data with
+> no lateral-movement structure, so a graph adds nothing and the "APT" claim is indefensible to
+> reviewers. To produce a publishable contribution we move to the **LANL Comprehensive,
+> Multi-Source Cyber-Security Events** dataset, where the graph is intrinsic and APT labels are
+> real. UNSW-NB15 work is retained as a secondary NIDS baseline / sanity check.
+
+## 13. Why LANL fixes all three blockers at once
+
+| Blocker (Part III) | How LANL resolves it |
+|---|---|
+| Graph is meaningless | Authentication events are **directed computer→computer edges** — a real enterprise network graph. Message passing now models lateral movement, the actual APT signal. |
+| "APT" claim is false | `redteam.txt` contains **749 ground-truth red-team compromise events** (ATT&CK-style lateral movement) — genuine APT labels, not synthesized attack categories. |
+| No contribution (GNN≈MLP) | Graph structure is the *only* way to detect lateral movement (a single auth looks benign; the **path** is malicious). Non-graph baselines are expected to lose — giving the GNN a real reason to exist. The federated angle (cross-domain, privacy-preserving lateral-movement detection) is under-explored on LANL. |
+
+## 14. Dataset
+
+**LANL "Comprehensive, Multi-Source Cyber-Security Events" (Kent, 2015)** — `csr.lanl.gov/data/cyber1/`.
+58 days, one enterprise network. Files (data-fence gated, signed URLs):
+
+| File | Schema | Role |
+|---|---|---|
+| `auth.txt.gz` (~9 GB gz, 1.05 B rows) | `time, src_user@dom, dst_user@dom, src_comp, dst_comp, auth_type, logon_type, auth_orientation, success/fail` | The authentication graph edges. |
+| `redteam.txt.gz` (~20 KB, 749 rows) | `time, user@dom, src_comp, dst_comp` | **Ground-truth malicious auth events** (APT labels). |
+| `proc.txt.gz`, `flows.txt.gz`, `dns.txt.gz` | (optional) | Multi-modal node/edge features for a richer model later. |
+
+**Reality of the label:** 749 malicious among ~1.05 B events (≈7×10⁻⁷). This is an extreme
+**anomaly-detection / rare-event** problem, not a balanced classifier. Evaluation must reflect that
+(§17).
+
+## 15. Task definition
+
+**Primary task — edge-level malicious-authentication detection (lateral movement).**
+Given a time-windowed authentication graph, classify each auth edge (or (src→dst, window) pair) as
+benign vs red-team. This is the faithful match to `redteam.txt`'s granularity and the standard LANL
+framing (cf. Bowman et al.; King & Huang "Euler"; Kent's own baselines).
+
+Secondary framings to report: node/host-window compromise classification; unsupervised anomaly
+scoring (autoencoder/GNN reconstruction) for a label-free baseline.
+
+## 16. Graph construction (`lanl_prep.py`)
+
+1. **Stream** `auth.txt.gz` line-by-line (never decompress fully); keep only events in a configurable
+   time window `[t_start, t_end]` and, optionally, logon-type events (`LogOn`, network logons) which
+   is where red-team activity lives.
+2. **Bucket** into snapshots of `Δt` (e.g., hourly or daily). Each snapshot → one graph.
+3. **Nodes** = computers (optionally also users, as a bipartite/heterogeneous graph later). **Edges** =
+   directed `src_comp → dst_comp` auth events aggregated within the bucket.
+4. **Edge features**: event count, success/fail counts & ratio, #distinct users, #distinct auth types,
+   one-hot of dominant auth/logon type, off-hours flag, src/dst out/in-degree, novelty (first-time
+   src→dst pair) — the features that distinguish lateral movement from routine logons.
+5. **Labels**: an edge is malicious if `(time≈bucket, user, src_comp, dst_comp)` matches a `redteam`
+   tuple (join on src/dst computer within the bucket's time span). Propagate to node-window labels if
+   needed.
+6. **Benign downsampling** (train only): keep ALL malicious edges; subsample benign edges/graphs to a
+   tractable ratio (e.g., 1:100–1:1000), and **state the ratio** — never touch the test window's
+   distribution.
+7. Output PyG snapshot graphs to disk (`results/lanl_graphs/`), plus a manifest with counts.
+
+## 17. Evaluation (this is where the paper is won or lost)
+
+Accuracy / macro-F1 are meaningless at 7×10⁻⁷ prevalence. Report the rare-event suite:
+- **ROC-AUC** and especially **PR-AUC / Average Precision** (the honest metric under extreme imbalance).
+- **Detection rate (recall) at fixed low false-positive budgets** — e.g., TPR @ FPR=10⁻³, 10⁻⁴; and
+  **precision@k / alerts-per-day** an analyst could triage. This is the operationally meaningful number.
+- **Temporal split**: train on early days, test on later days containing held-out red-team events —
+  no shuffling across time (prevents leakage; mirrors deployment).
+- Multi-seed mean ± std (R11).
+
+## 18. Federated design (the novelty lever)
+
+- **Partition by domain / host community** (natural organizational units) → realistic **non-IID**
+  federation, not the UNSW toy IID round-robin. Use the existing `ServerOpt` (FedAdam) machinery.
+- **Contribution angles** (pick/sharpen one): privacy-preserving *cross-organization* lateral-movement
+  detection (no enterprise shares raw auth logs); non-IID robustness of FedAdam vs FedAvg on a real
+  topology; communication-efficiency; optional differential-privacy on shared updates with a utility
+  curve.
+
+## 19. Baselines (mandatory, same temporal split)
+Logistic regression / XGBoost on edge features (no graph); node2vec/DeepWalk + classifier; an
+unsupervised anomaly baseline; centralized GNN; and ≥1 prior published LANL lateral-movement method.
+The GNN must beat the non-graph baselines on PR-AUC and detection@FPR — that is the paper's claim.
+
+## 20. Realistic targets
+Published LANL lateral-movement detectors report **ROC-AUC ≈0.95–0.99**; the differentiator is
+**PR-AUC and detection@low-FPR** (often AP in the 0.1–0.6 range depending on setup — high relative to a
+7×10⁻⁷ base rate). A federated model that approaches the centralized GNN's detection@FPR while
+preserving privacy is a legitimate, publishable result.
+
+## 21. Build stages (status)
+1. **`lanl_prep.py`** — streaming ingest + windowed auth-graph construction + redteam edge labels,
+   with a `--selftest` on synthetic LANL-format data. ✅ **done & tested.**
+2. **Data acquisition** — `auth.txt.gz` (7.2 GB) + `redteam.txt.gz` (749 events) in `datasets/`.
+   ✅ **done.** Built 384 hourly snapshots, days 0–15, 16.0 M edges, 457 malicious (`datasets/lanl_graphs/`).
+3. **`train_lanl.py`** — federated edge classifier (GraphSAGE node embeddings → edge MLP), negative
+   sampling, FedAdam, best-by-val (PR-AUC) checkpoint, rare-event metric suite, + no-graph and
+   centralized baselines. ✅ **done & run** (see REVELATIONS R13–R16).
+4. **Baselines + ablations + multi-seed** per §19/§17. *(partial — no-graph + centralized baselines
+   done; multi-seed and ablations pending).*
+
+## 22. Run 1 result & the road to a paper
+
+**Headline (official temporal test split, 217 mal / 5.38 M edges):** federated GNN **ROC-AUC 0.981,
+detects 79% of red-team logons @ 0.1% FPR**; GNN ≫ no-graph baseline (PR-AUC 4.6×); federation ≈/≥
+centralized. The graph and the federation both now earn their place — the contribution UNSW-NB15
+could not support.
+
+**To make it publishable, in priority order:**
+1. ~~**Non-IID-by-host partition** (§18)~~ ✅ **done (Run 4).** Louvain host-community partition
+   (13,222 hosts → 7 clients) revealed that **naive FedAdam collapses under realistic non-IID**
+   (PR-AUC 0.117 → 0.0016; REVELATIONS R17). This is now the paper's **problem statement**. Root
+   cause = edge-count aggregation weighting drowning the single attack-bearing client (R18).
+   **Contribution — DONE (Run 5, R19):** positive-aware aggregation (`--agg_weight positives`)
+   recovers non-IID detection 30× (PR-AUC 0.0016 → 0.048, detection@0.1%FPR 12% → 54%, ROC 0.985),
+   ~80% of the centralized upper bound, while preserving privacy. Remaining to harden the claim:
+   (a) ~~`--agg_weight uniform` ablation~~ ✅ **done (Run 6, R21).**
+   (b) ~~multi-seed mean±std~~ ✅ **done (Run 7, R22):** 3 seeds; fed(edges) 0.0014±0.0009 ≪
+   fed(positives) 0.081±0.036 ≈ centralized 0.074±0.014 ≤ fed(val_signal) 0.089±0.038.
+   (c) ~~`pos_smooth` sweep~~ ✅ **done (Run 7, R23):** monotonic dose-response (PR-AUC 0.045→0.0011
+   as smoothing 1→1000).
+   (d) ~~privacy-preserving variant~~ ✅ **done (Run 7, R22):** `--agg_weight val_signal` weights each
+   client by its *own* local-validation PR-AUC (one scalar, no shared labels/counts) and is best/at
+   parity (0.089 PR-AUC, 0.757 TPR@0.1%FPR).
+   **The empirical core is complete.** Orchestrated by `lanl_experiments.py`; main table in
+   `results/lanl_experiment_summary.md`. Optional remaining: SCAFFOLD/FedProx comparison, more LANL
+   days, differential-privacy utility curve, and the write-up.
+2. **Multi-seed mean ± std** (≥3–5 seeds) for every model; the federated>centralized claim needs
+   error bars (R14/R11).
+3. **Stronger / more baselines** (§19): logistic regression & XGBoost on edge features, node2vec, and
+   ≥1 prior published LANL lateral-movement method, all on the identical split.
+4. **Scale & ablate**: more days (toward full 58), daily vs hourly snapshots, temporal node identity
+   across snapshots, edge-feature ablation, FPR-budget sweep.
+5. **Tighten selection**: larger/again-stratified val or smoothed selection to close the val→test
+   PR-AUC gap (R16).
+6. *(optional)* differential-privacy on shared updates with a utility curve, for the privacy claim.
+
+---
+
 *This document is maintained alongside the project and should be updated after each training run.*

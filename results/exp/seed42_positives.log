@@ -1,0 +1,50 @@
+Device: cpu | seed=42 | agg_weight=positives
+Loading snapshots from ../datasets/lanl_graphs ...
+  384 snapshots, t in [0, 1378800]
+  train: 212 snaps (209 mal edges) | val: 52 snaps (31 mal) | test: 120 snaps (217 mal)
+
+[baseline] no-graph edge-MLP (centralized)...
+    {'roc_auc': 0.9109558795077682, 'pr_auc': 0.012923299855690934}
+[baseline] centralized GNN...
+    {'roc_auc': 0.991517654345421, 'pr_auc': 0.0661232424253416}
+
+Federated GNN: 7 clients, 15 rounds, server_opt=fedadam, neg_per_pos=50, partition=host
+  [partition] 13,222 hosts, 15 communities -> 7 clients
+  client      hosts   snaps     edges   mal_edges
+  client 1      2163     212 1,812,423           0
+  client 2      1438     212   876,012           0
+  client 3      1430     212   977,523           0
+  client 4      2056     212 1,180,553         204
+  client 5      2040     212 1,343,922           1
+  client 6      2050     212 1,220,076           4
+  client 7      2045     212 1,209,884           0
+  aggregation weighting = 'positives'  (client shares: C1=0.46%, C2=0.46%, C3=0.46%, C4=94.91%, C5=0.93%, C6=2.31%, C7=0.46%)
+  Round 1/15: val PR-AUC=0.016410872142550957 | test PR-AUC=0.01454976958901435 ROC-AUC=0.9761913020917202
+  Round 2/15: val PR-AUC=0.011732663310686228 | test PR-AUC=0.01260749623592244 ROC-AUC=0.9823398304108357
+  Round 3/15: val PR-AUC=0.011851583787802546 | test PR-AUC=0.015618614169631471 ROC-AUC=0.9837163600576229
+  Round 4/15: val PR-AUC=0.013964871040675475 | test PR-AUC=0.024096423679900718 ROC-AUC=0.984979662801177
+  Round 5/15: val PR-AUC=0.03235067540602766 | test PR-AUC=0.04137445312280291 ROC-AUC=0.9846013528858986
+  Round 6/15: val PR-AUC=0.06321934370049294 | test PR-AUC=0.045212512046428656 ROC-AUC=0.9819593355217412
+  Round 7/15: val PR-AUC=0.042625848865450386 | test PR-AUC=0.03271277132506218 ROC-AUC=0.9773739665293505
+  Round 8/15: val PR-AUC=0.017268004881901333 | test PR-AUC=0.02367875626516441 ROC-AUC=0.976987681331065
+  Round 9/15: val PR-AUC=0.011466776204701658 | test PR-AUC=0.018418165067436206 ROC-AUC=0.9756610932081978
+  Round 10/15: val PR-AUC=0.009208847962674153 | test PR-AUC=0.01676306423248681 ROC-AUC=0.9756137789674263
+  Round 11/15: val PR-AUC=0.008153327873903287 | test PR-AUC=0.01633370775089277 ROC-AUC=0.9771483454816375
+  Round 12/15: val PR-AUC=0.007592607021978279 | test PR-AUC=0.016716500809670208 ROC-AUC=0.9824847522922315
+  Round 13/15: val PR-AUC=0.011132490118891582 | test PR-AUC=0.02090591418694841 ROC-AUC=0.9807648967410989
+  Round 14/15: val PR-AUC=0.02045454126247132 | test PR-AUC=0.02425529814851776 ROC-AUC=0.9768971686407254
+  Round 15/15: val PR-AUC=0.02349117833256413 | test PR-AUC=0.025304614973443707 ROC-AUC=0.9681231864133367
+
+Selected round 6 (val PR-AUC=0.0632)
+
+================================================================
+LANL lateral-movement detection — official temporal test split
+================================================================
+  model             ROC-AUC   PR-AUC  TPR@1e-3  TPR@1e-4
+  nograph_mlp        0.9110   0.0129     0.336     0.032
+  centralized_gnn    0.9915   0.0661     0.641     0.276
+  federated_gnn      0.9820   0.0452     0.705     0.000
+  (test base rate = 4.04e-05, 217 malicious / 5,376,274 edges)
+
+Saved results/lanl_comparison.json, lanl_pr_curves.png, lanl_global_model.pt
+Done in 0h 58m 49s.
