@@ -31,7 +31,7 @@ htmlcov/
 .tox/
 
 # ── Jupyter Notebooks ─────────────────────────────────────────────────────────
-# .ipynb_checkpoints/
+.ipynb_checkpoints/
 
 # ── ML outputs & checkpoints ──────────────────────────────────────────────────
 *.pt
@@ -43,6 +43,14 @@ logs/
 outputs/
 checkpoints/
 train-logs.txt
+lanl-train-logs*.txt
+*.log
+
+# ── Large datasets & archives (never committed) ───────────────────────────────
+datasets/
+*.zip
+*.bz2
+*.gz
 
 # ── IDE & editor files ────────────────────────────────────────────────────────
 .vscode/

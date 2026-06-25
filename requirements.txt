@@ -1,35 +1,25 @@
-# Core Python and data handling
+# Core data handling
 pandas==2.2.3
 numpy==1.26.4
 scikit-learn==1.5.2
 
-# PyTorch (core + CUDA)
+# PyTorch (CPU build used in this project)
 torch==2.4.1
-torchvision==0.19.1
-torchaudio==2.4.1
 
-# PyTorch Geometric (Graph Neural Network library)
-# NOTE: torch-scatter, torch-sparse, torch-cluster, torch-spline-conv must be
-# installed separately via the PyG pre-built wheel index (see install instructions below).
+# PyTorch Geometric — only SAGEConv + DataLoader are used.
+# torch-scatter/sparse/cluster/spline-conv are NOT required for this project; if you
+# extend it and need them: pip install torch-scatter torch-sparse \
+#   -f https://data.pyg.org/whl/torch-2.4.1+cpu.html
 torch-geometric==2.5.3
 
-# Graph building and analysis
+# Graph building / community detection (Louvain)
 networkx==3.3
 
 # Visualization & metrics
 matplotlib==3.9.2
-seaborn==0.13.2
 
-# Utility / environment
-tqdm==4.66.5
-joblib==1.4.2
+# Environment variables (.env -> DATASET_PATH)
 python-dotenv
 
-# Additional downloads
-# pip install torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.4.1+cpu.html
-
-# Kaggle
+# Optional: only for downloading the UNSW-NB15 dataset (preliminary study)
 kagglehub
-
-# Sampling methods
-imblearn
