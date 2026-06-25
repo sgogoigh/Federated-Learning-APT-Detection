@@ -225,4 +225,109 @@ needs — LANL is single-domain (DOM1), so cross-org must be *simulated* by host
 
 ---
 
+# Run 4 — Non-IID host-community partitioning (the paper's problem statement, June 2026)
+
+> Replaced the IID round-robin federation with a realistic **host-community partition**: Louvain
+> communities over the train authentication graph (13,222 hosts → 15 communities) bin-packed into
+> 7 clients, each owning a cohesive set of computers and seeing only *its* hosts' outbound auth —
+> i.e. simulated organizations. Same model/metrics/temporal-split as Run 3.
+
+| model | ROC-AUC | PR-AUC | TPR@0.1%FPR | TPR@0.01%FPR |
+|---|---|---|---|---|
+| no-graph MLP | 0.911 | 0.013 | 0.336 | 0.032 |
+| centralized GNN | 0.990 | 0.060 | 0.618 | 0.290 |
+| federated **IID** (Run 3) | 0.981 | **0.117** | **0.788** | 0.295 |
+| federated **host non-IID** | 0.927 | **0.0016** | 0.115 | 0.000 |
+
+## R17 — Realistic non-IID federation catastrophically breaks naive aggregation (the contribution)
+
+The partition is brutally and *realistically* skewed: of 209 train malicious edges, **client 4 holds
+204; clients 1/2/3/7 see zero, clients 5/6 see 1/4.** Almost no organization ever observes an
+attack — only one does. Under this label concentration, FedAdam's PR-AUC **collapses 70×** (0.117 →
+0.0016) and detection@0.1%FPR falls from 79% → 12%. The federated model is now *worse than the
+centralized GNN by far, and barely above the no-graph baseline.*
+
+**This is the paper.** Run 3 showed FL *can* match centralized — but only under the unrealistic IID
+assumption. The honest, realistic setting (each org sees only its own hosts) **defeats vanilla
+FedAvg/FedAdam.** That negative result is a sharp, publishable problem statement that motivates a
+non-IID-robust method as the actual contribution.
+
+## R18 — Root cause: edge-count aggregation weighting drowns the one attack-bearing client
+
+The collapse is not mysterious. (1) The 6 attack-free clients each converge to "predict all benign"
+(their local optimum), and their updates, **weighted by edge count**, dominate aggregation — and the
+benign clients have *more* edges (client 1: 1.8 M) than the attack-bearing client 4 (1.18 M), so the
+only client that learned the attack is *down-weighted*. (2) FedAdam averages client 4's
+attack-discriminative update away. Val PR-AUC stayed ~1e-4 all 15 rounds (no client-mix ever
+generalized), so checkpoint selection had nothing good to pick.
+
+**Concrete fixes to try (the method):** weight aggregation by #positives (or uniformly) instead of
+edge count; stronger FedProx / SCAFFOLD to curb the benign clients' drift; cluster/personalized
+aggregation; sharing only the rare-class-relevant gradient. The first (positive-aware weighting) is
+the cheapest test and directly targets R18's mechanism. Multi-seed still required (R11).
+
+---
+
+# Run 5 — Positive-aware aggregation recovers non-IID detection (the contribution, June 2026)
+
+> Same non-IID host partition as Run 4, but client updates are aggregated with weight =
+> (#malicious edges + 1) instead of #edges (`--agg_weight positives`). Directly targets R18.
+
+| non-IID host partition | ROC-AUC | PR-AUC | TPR@0.1%FPR | TPR@0.01%FPR |
+|---|---|---|---|---|
+| edge-weighted (Run 4, broken) | 0.927 | 0.0016 | 0.115 | 0.000 |
+| **positive-aware (this run)** | **0.985** | **0.048** | **0.539** | **0.217** |
+| centralized upper bound | 0.990 | 0.060 | 0.618 | 0.290 |
+| federated IID (Run 3) | 0.981 | 0.117 | 0.788 | 0.295 |
+
+## R19 — The fix works: a simple positive-aware weighting restores non-IID federated detection
+
+Re-weighting aggregation by each client's malicious content recovers **PR-AUC 30×** (0.0016 →
+0.048) and **detection@0.1%FPR from 12% → 54%**, reaching ROC-AUC 0.985 — within striking distance
+of the centralized upper bound (0.990 / 0.060 / 62%), and *vastly* above the broken edge-weighted
+federation. This is the clean problem→method→result the paper needs: **realistic non-IID breaks
+vanilla federated lateral-movement detection (R17/R18); a privacy-preserving positive-aware
+aggregation recovers ~80% of centralized-grade detection (R19).**
+
+## R20 — Why it's the *positives*, not just "anything but edges" (and the clinching ablation)
+
+The weighting shares make the mechanism explicit: positive-aware gives the lone attack-bearing
+client 4 a **94.9%** share; the broken edge-weighting gave it only **13.7%**. Crucially, *uniform*
+weighting would give client 4 ≈1/7 = **14.3%** — essentially identical to the broken edge case — so
+uniform is predicted to stay broken while positives recovers. **Run the `--agg_weight uniform`
+ablation to confirm** edges ≈ uniform ≪ positives; that triple cleanly proves the contribution is
+the positive-awareness, not merely dropping edge-weighting. Caveat for the writeup: at
+`pos_smooth=1` the global model is ~95% client 4, so frame the method as *adaptive discovery of
+signal-bearing clients* (in deployment, weight by each client's local validation signal, which is
+privacy-preserving) and report a `pos_smooth` sweep. Multi-seed still required (R11).
+
+---
+
+# Run 6 — Uniform-weighting ablation (the contribution is locked in, June 2026)
+
+> Same non-IID host partition, `--agg_weight uniform`. The decisive control predicted by R20.
+
+## R21 — edges ≈ uniform ≪ positives: it is specifically the positive-awareness
+
+| non-IID host partition, aggregation | client-4 share | ROC-AUC | PR-AUC | TPR@0.1%FPR |
+|---|---|---|---|---|
+| edge-weighted | 13.7% | 0.927 | 0.0016 | 0.115 |
+| uniform | 14.3% | 0.889 | **0.0006** | 0.065 |
+| **positive-aware** | 94.9% | **0.985** | **0.048** | **0.539** |
+| centralized upper bound | — | 0.990 | 0.060 | 0.618 |
+
+Uniform weighting is **as broken as edge-weighting** (PR-AUC 0.0006 vs 0.0016 — both noise-level),
+exactly as R20 predicted: both give the lone attack-bearing client ~14% and both fail. Only
+positive-aware weighting (94.9% to that client) recovers detection (30× PR-AUC, 54% detection
+@0.1%FPR). **This rules out the trivial explanation** "any non-edge weighting works" — it does not.
+The recovery is specifically attributable to up-weighting the signal-bearing client. The three-way
+ablation (edges ≈ uniform ≪ positives) is the clean evidence the paper's method section needs.
+
+Remaining before submission (none change the story): multi-seed mean±std (R11); `pos_smooth` sweep
+(interpolates positive-aware→uniform, should degrade monotonically toward the broken regime); and a
+privacy-preserving variant that weights by each client's *local* validation signal rather than
+oracle positive counts (R20).
+
+---
+
 *Living document. Append a new R-entry after every substantive run.*

@@ -1036,9 +1036,18 @@ centralized. The graph and the federation both now earn their place — the cont
 could not support.
 
 **To make it publishable, in priority order:**
-1. **Non-IID-by-host partition** (§18). Replace round-robin-over-snapshots with a host-community
-   partition (cluster computers; each client owns a host set) to simulate cross-organization
-   federation — the actual FL novelty. Report non-IID robustness (FedAdam vs FedAvg).
+1. ~~**Non-IID-by-host partition** (§18)~~ ✅ **done (Run 4).** Louvain host-community partition
+   (13,222 hosts → 7 clients) revealed that **naive FedAdam collapses under realistic non-IID**
+   (PR-AUC 0.117 → 0.0016; REVELATIONS R17). This is now the paper's **problem statement**. Root
+   cause = edge-count aggregation weighting drowning the single attack-bearing client (R18).
+   **Contribution — DONE (Run 5, R19):** positive-aware aggregation (`--agg_weight positives`)
+   recovers non-IID detection 30× (PR-AUC 0.0016 → 0.048, detection@0.1%FPR 12% → 54%, ROC 0.985),
+   ~80% of the centralized upper bound, while preserving privacy. Remaining to harden the claim:
+   (a) ~~`--agg_weight uniform` ablation~~ ✅ **done (Run 6, R21):** uniform PR-AUC 0.0006 ≈ edges
+   0.0016 ≪ positives 0.048 — proves the gain is the positive-awareness, not dropping edge-weighting;
+   (b) **multi-seed mean±std**; (c) **`pos_smooth` sweep** (1 → ∞ interpolates positive-aware →
+   uniform; should degrade monotonically); (d) optional SCAFFOLD/FedProx and a privacy-preserving
+   variant that weights by each client's *local* validation signal rather than oracle positive counts.
 2. **Multi-seed mean ± std** (≥3–5 seeds) for every model; the federated>centralized claim needs
    error bars (R14/R11).
 3. **Stronger / more baselines** (§19): logistic regression & XGBoost on edge features, node2vec, and

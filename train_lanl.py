@@ -29,6 +29,7 @@ class Logger(object):
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.data import Data
 from torch_geometric.nn import SAGEConv
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
@@ -184,6 +185,69 @@ def rare_metrics(y, p):
 
 
 # ---------------------------------------------------------------------------
+# Non-IID host-community partitioning (the federated novelty)
+# ---------------------------------------------------------------------------
+def build_host_partition(train_snaps, k, seed):
+    """Cluster computers into communities (Louvain on the aggregated train auth graph) and
+    bin-pack communities into `k` balanced clients. Each client = a cohesive set of HOSTS,
+    simulating an organization that only sees its own machines' auth logs (realistic non-IID).
+    Returns (lut: np.array gid->client, sizes: per-client host counts)."""
+    import networkx as nx
+    from collections import defaultdict
+    w = defaultdict(int)
+    for g in train_snaps:
+        gid = g.node_gid.numpy(); ei = g.edge_index.numpy()
+        if ei.shape[1] == 0:
+            continue
+        u = gid[ei[0]]; v = gid[ei[1]]
+        for a_, b_ in zip(u.tolist(), v.tolist()):
+            if a_ == b_:
+                continue
+            w[(a_, b_) if a_ < b_ else (b_, a_)] += 1
+    G = nx.Graph()
+    for (u_, v_), ww in w.items():
+        G.add_edge(u_, v_, weight=ww)
+    try:
+        comms = nx.community.louvain_communities(G, weight="weight", seed=seed)
+    except Exception as e:
+        print(f"  [partition] louvain failed ({e}); falling back to label propagation")
+        comms = list(nx.community.label_propagation_communities(G))
+    comms = sorted(comms, key=len, reverse=True)
+    print(f"  [partition] {G.number_of_nodes():,} hosts, {len(comms)} communities -> {k} clients")
+
+    bins, sizes = [[] for _ in range(k)], [0] * k
+    for c in comms:                                     # greedy bin-pack: keep communities intact
+        j = min(range(k), key=lambda i: sizes[i])
+        bins[j].extend(c); sizes[j] += len(c)
+    max_gid = max((n for n in G.nodes), default=0)
+    lut = np.full(max_gid + 1, -1, dtype=np.int64)
+    for ci, b in enumerate(bins):
+        for gid in b:
+            lut[gid] = ci
+    return lut, [len(b) for b in bins]
+
+
+def client_subgraph(g, lut, c):
+    """Extract the subgraph of edges whose SOURCE host belongs to client `c` (the org owns its
+    machines' outbound auth). Boundary destination hosts appear as nodes. Returns a Data or None."""
+    gid = g.node_gid.numpy(); ei = g.edge_index.numpy()
+    if ei.shape[1] == 0:
+        return None
+    src_gid = gid[ei[0]]
+    src_cli = np.where(src_gid < len(lut), lut[np.clip(src_gid, 0, len(lut) - 1)], -1)
+    eidx = np.where(src_cli == c)[0]
+    if eidx.size == 0:
+        return None
+    sub_ei = ei[:, eidx]
+    used, inv = np.unique(sub_ei, return_inverse=True)
+    new_ei = torch.tensor(inv.reshape(2, -1), dtype=torch.long)
+    sub = Data(x=g.x[used], edge_index=new_ei,
+               edge_attr=g.edge_attr[eidx], edge_y=g.edge_y[eidx])
+    sub.node_gid = g.node_gid[used]; sub.num_nodes = len(used)
+    return sub
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main(a):
@@ -236,9 +300,47 @@ def main(a):
 
     # ---- Federated GNN ----
     print(f"\nFederated GNN: {a.num_clients} clients, {a.rounds} rounds, "
-          f"server_opt={a.server_opt}, neg_per_pos={a.neg_per_pos}")
+          f"server_opt={a.server_opt}, neg_per_pos={a.neg_per_pos}, partition={a.partition}")
     clients = {i: [] for i in range(a.num_clients)}
-    for i, g in enumerate(train): clients[i % a.num_clients].append(g)  # round-robin (IID over snapshots)
+    if a.partition == "host":
+        # Non-IID: each client owns a host community and sees only its hosts' outbound auth.
+        lut, host_sizes = build_host_partition(train, a.num_clients, SEED)
+        for g in train:
+            for c in range(a.num_clients):
+                sub = client_subgraph(g, lut, c)
+                if sub is not None:
+                    clients[c].append(sub)
+    else:
+        for i, g in enumerate(train):
+            clients[i % a.num_clients].append(g)        # IID round-robin over full snapshots
+        host_sizes = None
+
+    # Report the non-IID skew (this IS the federated story)
+    print("  client      hosts   snaps     edges   mal_edges")
+    part_stats = []
+    for c in range(a.num_clients):
+        cs = clients[c]
+        e = int(sum(int(s.edge_index.shape[1]) for s in cs))
+        m = int(sum(int(s.edge_y.sum()) for s in cs))
+        h = host_sizes[c] if host_sizes else "-"
+        print(f"  client {c+1:<2d} {str(h):>8s} {len(cs):>7d} {e:>9,} {m:>11d}")
+        part_stats.append({"client": c + 1, "hosts": (h if host_sizes else None),
+                           "snaps": len(cs), "edges": e, "mal_edges": m})
+
+    # ---- Aggregation weighting (the non-IID fix, REVELATIONS R18) ----
+    # edges    : weight by #edges (baseline; drowns the lone attack-bearing client)
+    # uniform  : equal weight per client
+    # positives: weight by #malicious edges (+smoothing) so rare-signal clients aren't averaged away
+    def agg_weight(c):
+        if a.agg_weight == "uniform":
+            return 1.0
+        if a.agg_weight == "positives":
+            return part_stats[c]["mal_edges"] + a.pos_smooth
+        return float(part_stats[c]["edges"])
+    agg_w = [agg_weight(c) for c in range(a.num_clients)]
+    tot_w = sum(agg_w) or 1.0
+    print(f"  aggregation weighting = '{a.agg_weight}'  (client shares: " +
+          ", ".join(f"C{c+1}={agg_w[c]/tot_w:.2%}" for c in range(a.num_clients)) + ")")
 
     init = EdgeGNN(node_dim, edge_dim, a.hidden_dim, use_graph=True).to(DEVICE)
     server = ServerOpt(init.state_dict(), mode=a.server_opt, lr=a.server_lr)
@@ -250,8 +352,8 @@ def main(a):
         states, weights = [], []
         for i in range(a.num_clients):
             if not clients[i]: continue
-            st, ne = train_local(clients[i], gstate, base_cfg, f"C{i+1}")
-            states.append(st); weights.append(ne)
+            st, _ne = train_local(clients[i], gstate, base_cfg, f"C{i+1}")
+            states.append(st); weights.append(agg_w[i])      # positive-aware (or chosen) weighting
         gstate = server.step(states, weights)
         gnet.load_state_dict(gstate, strict=False)
         vy, vp = predict(gnet, val); ty, tp = predict(gnet, test)
@@ -272,7 +374,8 @@ def main(a):
 
     # ---- Save + report ----
     with open("results/lanl_comparison.json", "w") as f:
-        json.dump({"models": comparison, "trajectory": traj,
+        json.dump({"models": comparison, "trajectory": traj, "partition": a.partition,
+                   "agg_weight": a.agg_weight, "client_partition": part_stats,
                    "split": {"t_split": a.t_split, "t_test_end": a.t_test_end}}, f, indent=2)
 
     print("\n" + "=" * 64)
@@ -323,6 +426,12 @@ if __name__ == "__main__":
     p.add_argument("--hidden_dim", type=int, default=64)
     p.add_argument("--neg_per_pos", type=int, default=50)
     p.add_argument("--val_frac", type=float, default=0.2)
+    p.add_argument("--partition", choices=["host", "iid"], default="host",
+                   help="host = non-IID host-community partition; iid = round-robin over snapshots")
+    p.add_argument("--agg_weight", choices=["positives", "uniform", "edges"], default="positives",
+                   help="client aggregation weighting: positives (R18 fix) / uniform / edges (baseline)")
+    p.add_argument("--pos_smooth", type=float, default=1.0,
+                   help="smoothing added to each client's malicious-edge count for 'positives' weighting")
     p.add_argument("--server_opt", choices=["fedadam", "fedavg"], default="fedadam")
     p.add_argument("--server_lr", type=float, default=0.05)
     p.add_argument("--skip_baselines", action="store_true")

@@ -116,9 +116,10 @@ def _redteam_hit(rt_idx, src, dst, b_start, b_end):
     return False
 
 
-def build_snapshot(bucket_id, rows, bucket, rt_idx, seen_pairs):
+def build_snapshot(bucket_id, rows, bucket, rt_idx, seen_pairs, vocab=None):
     """Aggregate one bucket's auth events into a labeled directed graph dict.
-    Mutates `seen_pairs` (global novelty tracking). Returns a dict (torch-free)."""
+    Mutates `seen_pairs` (global novelty) and `vocab` (global computer->id, for host
+    partitioning). Returns a dict (torch-free)."""
     b_start = bucket_id * bucket
     b_end = b_start + bucket
 
@@ -149,6 +150,16 @@ def build_snapshot(bucket_id, rows, bucket, rt_idx, seen_pairs):
     nodes = sorted(set(node_out) | set(node_in))
     nidx = {c: i for i, c in enumerate(nodes)}
 
+    # Global, snapshot-stable computer ids (enables host-community partitioning downstream)
+    if vocab is not None:
+        node_gid = np.empty(len(nodes), dtype=np.int64)
+        for c, i in nidx.items():
+            if c not in vocab:
+                vocab[c] = len(vocab)
+            node_gid[i] = vocab[c]
+    else:
+        node_gid = np.arange(len(nodes), dtype=np.int64)
+
     x = np.zeros((len(nodes), len(NODE_FEAT_NAMES)), dtype=np.float32)
     for c, i in nidx.items():
         x[i] = [node_out[c], node_in[c], len(node_out_dst[c]),
@@ -169,6 +180,7 @@ def build_snapshot(bucket_id, rows, bucket, rt_idx, seen_pairs):
     return {
         "bucket": int(bucket_id), "t_start": int(b_start), "t_end": int(b_end),
         "nodes": nodes,
+        "node_gid": node_gid,
         "x": x,
         "edge_index": np.array([src_idx, dst_idx], dtype=np.int64) if src_idx
                       else np.zeros((2, 0), dtype=np.int64),
@@ -210,6 +222,8 @@ def to_pyg(snap):
         edge_y=torch.from_numpy(snap["edge_y"]),
     )
     d.num_nodes = snap["x"].shape[0]
+    if "node_gid" in snap:
+        d.node_gid = torch.from_numpy(snap["node_gid"])
     return d
 
 
@@ -222,11 +236,12 @@ def build_all(auth_path, redteam_path, t_start, t_end, bucket,
     print(f"  redteam events loaded: {n_rt} ({len(rt_idx)} distinct src->dst pairs)")
     rng = np.random.default_rng(42)
     seen_pairs = set()
+    vocab = {}                                          # computer name -> global id
     snaps, total_e, total_mal = [], 0, 0
 
     rows = stream_auth(auth_path, t_start, t_end, logon_only=logon_only)
     for bid, buf in iter_buckets(rows, bucket):
-        snap = build_snapshot(bid, buf, bucket, rt_idx, seen_pairs)
+        snap = build_snapshot(bid, buf, bucket, rt_idx, seen_pairs, vocab)
         if snap["edge_index"].shape[1] < min_edges:
             continue
         if benign_ratio > 0:
@@ -249,7 +264,9 @@ def build_all(auth_path, redteam_path, t_start, t_end, bucket,
         }
         with open(os.path.join(out_dir, "manifest.json"), "w") as f:
             json.dump(manifest, f, indent=2)
-        print(f"  saved snapshots + manifest to {out_dir}")
+        with open(os.path.join(out_dir, "vocab.json"), "w") as f:
+            json.dump({"n_computers": len(vocab)}, f)   # full map is large; store size only
+        print(f"  saved {len(snaps)} snapshots + manifest ({len(vocab):,} computers) to {out_dir}")
     return snaps
 
 
