@@ -330,4 +330,51 @@ oracle positive counts (R20).
 
 ---
 
+# Run 7 — Multi-seed consolidation + pos_smooth sweep + privacy-preserving variant (June 2026)
+
+> 12-run matrix (seeds 42/7/123), non-IID host partition, aggregated to mean ± std
+> (`results/lanl_experiment_summary.md`). This is the paper's main results table.
+
+## R22 — With error bars, the contribution holds: positive-aware *and* the privacy-preserving variant match centralized; naive FL is broken
+
+| model (non-IID host) | ROC-AUC | PR-AUC | TPR@0.1%FPR | TPR@0.01%FPR |
+|---|---|---|---|---|
+| no-graph MLP | 0.901 ± 0.009 | 0.0070 ± 0.0044 | 0.221 ± 0.150 | 0.012 ± 0.014 |
+| centralized GNN | 0.992 ± 0.001 | 0.074 ± 0.014 | 0.705 ± 0.070 | 0.309 ± 0.049 |
+| fed (edges, naive) | 0.905 ± 0.012 | **0.0014 ± 0.0009** | 0.086 ± 0.060 | 0.012 ± 0.014 |
+| fed (positives) | 0.985 ± 0.003 | 0.081 ± 0.036 | 0.724 ± 0.043 | 0.227 ± 0.168 |
+| **fed (val_signal, private)** | 0.978 ± 0.010 | **0.089 ± 0.038** | **0.757 ± 0.059** | 0.298 ± 0.109 |
+
+Findings, now statistically grounded over 3 seeds:
+1. **Graph ≫ no-graph** — centralized PR-AUC 0.074 vs 0.007 (10×), non-overlapping error.
+2. **Naive non-IID FL is broken** — fed(edges) 0.0014 ± 0.0009, ~50× below centralized, far outside error.
+3. **Positive-aware recovers to parity with centralized** — fed(positives) 0.081 ± 0.036 and TPR@0.1%FPR
+   0.724 vs centralized 0.705; error bars overlap → the honest claim is *matches* centralized while
+   preserving privacy.
+4. **The privacy-preserving variant is best/at-parity** — fed(val_signal) 0.089 PR-AUC / 0.757
+   TPR@0.1%FPR, using only each client's *own* local-validation scalar (no global label counts).
+   This is the strongest framing: privacy-preserving federation **need not cost detection**.
+
+## R23 — pos_smooth sweep confirms the mechanism is continuous and monotonic
+
+Seed-42 positive-aware weighting, smoothing 1 → 1000 (flat → uniform):
+
+| pos_smooth | ROC-AUC | PR-AUC | TPR@0.1%FPR |
+|---|---|---|---|
+| 1   | 0.982 | 0.045 | 0.705 |
+| 10  | 0.975 | 0.041 | 0.512 |
+| 100 | 0.938 | 0.0044 | 0.198 |
+| 1000| 0.907 | 0.0011 | 0.097 |
+
+As smoothing grows, the weighting flattens toward uniform and detection **degrades
+monotonically** back to the broken regime (PR-AUC 0.045 → 0.0011; the 1000 value ≈ the uniform/edges
+baseline). This is the dose-response curve a reviewer wants: the effect tracks the degree of
+positive-awareness, not a single lucky hyperparameter.
+
+**Status:** the paper's empirical core is complete — problem (R17/R18), method (R19), isolation
+(R21), error-barred main table (R22), and mechanism sweep (R23). Remaining is write-up, related-work
+positioning, and optional extras (SCAFFOLD/FedProx comparison, more days, DP utility curve).
+
+---
+
 *Living document. Append a new R-entry after every substantive run.*

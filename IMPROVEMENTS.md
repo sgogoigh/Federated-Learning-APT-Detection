@@ -1043,11 +1043,17 @@ could not support.
    **Contribution — DONE (Run 5, R19):** positive-aware aggregation (`--agg_weight positives`)
    recovers non-IID detection 30× (PR-AUC 0.0016 → 0.048, detection@0.1%FPR 12% → 54%, ROC 0.985),
    ~80% of the centralized upper bound, while preserving privacy. Remaining to harden the claim:
-   (a) ~~`--agg_weight uniform` ablation~~ ✅ **done (Run 6, R21):** uniform PR-AUC 0.0006 ≈ edges
-   0.0016 ≪ positives 0.048 — proves the gain is the positive-awareness, not dropping edge-weighting;
-   (b) **multi-seed mean±std**; (c) **`pos_smooth` sweep** (1 → ∞ interpolates positive-aware →
-   uniform; should degrade monotonically); (d) optional SCAFFOLD/FedProx and a privacy-preserving
-   variant that weights by each client's *local* validation signal rather than oracle positive counts.
+   (a) ~~`--agg_weight uniform` ablation~~ ✅ **done (Run 6, R21).**
+   (b) ~~multi-seed mean±std~~ ✅ **done (Run 7, R22):** 3 seeds; fed(edges) 0.0014±0.0009 ≪
+   fed(positives) 0.081±0.036 ≈ centralized 0.074±0.014 ≤ fed(val_signal) 0.089±0.038.
+   (c) ~~`pos_smooth` sweep~~ ✅ **done (Run 7, R23):** monotonic dose-response (PR-AUC 0.045→0.0011
+   as smoothing 1→1000).
+   (d) ~~privacy-preserving variant~~ ✅ **done (Run 7, R22):** `--agg_weight val_signal` weights each
+   client by its *own* local-validation PR-AUC (one scalar, no shared labels/counts) and is best/at
+   parity (0.089 PR-AUC, 0.757 TPR@0.1%FPR).
+   **The empirical core is complete.** Orchestrated by `lanl_experiments.py`; main table in
+   `results/lanl_experiment_summary.md`. Optional remaining: SCAFFOLD/FedProx comparison, more LANL
+   days, differential-privacy utility curve, and the write-up.
 2. **Multi-seed mean ± std** (≥3–5 seeds) for every model; the federated>centralized claim needs
    error bars (R14/R11).
 3. **Stronger / more baselines** (§19): logistic regression & XGBoost on edge features, node2vec, and

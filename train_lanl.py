@@ -227,6 +227,33 @@ def build_host_partition(train_snaps, k, seed):
     return lut, [len(b) for b in bins]
 
 
+def compute_val_signals(clients, num_clients, cfg, epochs=3):
+    """Privacy-preserving client weighting: each client trains a quick model on its OWN
+    local-train split and reports a single scalar = its local-validation PR-AUC (average
+    precision) on its OWN held-out data. No raw data and no global label counts are shared —
+    only one performance number per client. Clients with no local positives report ~0.
+    Returns a list of signals (one per client)."""
+    signals = []
+    for c in range(num_clients):
+        cs = clients[c]
+        if len(cs) < 2:
+            signals.append(0.0); continue
+        lt = [s for s in cs if int(s.edge_y.sum()) > 0]      # stratify locally
+        lb = [s for s in cs if int(s.edge_y.sum()) == 0]
+        random.shuffle(lt); random.shuffle(lb)
+        nvt, nvb = max(1, int(0.2 * len(lt))) if lt else 0, max(1, int(0.2 * len(lb))) if lb else 0
+        lval = lt[:nvt] + lb[:nvb]; ltr = lt[nvt:] + lb[nvb:]
+        if not ltr or not lval:
+            ltr = lval = cs
+        st, _ = train_local(ltr, None, dict(cfg, epochs=epochs), f"sig{c+1}")
+        m = EdgeGNN(cfg["node_dim"], cfg["edge_dim"], cfg["hid"], use_graph=True).to(DEVICE)
+        m.load_state_dict(st)
+        y, p = predict(m, lval)
+        sig = average_precision_score(y, p) if (0 < int(y.sum()) < len(y)) else 0.0
+        signals.append(float(sig))
+    return signals
+
+
 def client_subgraph(g, lut, c):
     """Extract the subgraph of edges whose SOURCE host belongs to client `c` (the org owns its
     machines' outbound auth). Boundary destination hosts appear as nodes. Returns a Data or None."""
@@ -252,7 +279,10 @@ def client_subgraph(g, lut, c):
 # ---------------------------------------------------------------------------
 def main(a):
     t0 = time.time()
-    print(f"Device: {DEVICE}\nLoading snapshots from {a.graph_dir} ...")
+    random.seed(a.seed); np.random.seed(a.seed); torch.manual_seed(a.seed)
+    global RNG; RNG = np.random.default_rng(a.seed)
+    print(f"Device: {DEVICE} | seed={a.seed} | agg_weight={a.agg_weight}")
+    print(f"Loading snapshots from {a.graph_dir} ...")
     snaps = load_snaps(a.graph_dir, a.bucket)
     print(f"  {len(snaps)} snapshots, t in [{snaps[0].t_start}, {snaps[-1].t_start}]")
 
@@ -304,7 +334,7 @@ def main(a):
     clients = {i: [] for i in range(a.num_clients)}
     if a.partition == "host":
         # Non-IID: each client owns a host community and sees only its hosts' outbound auth.
-        lut, host_sizes = build_host_partition(train, a.num_clients, SEED)
+        lut, host_sizes = build_host_partition(train, a.num_clients, a.seed)
         for g in train:
             for c in range(a.num_clients):
                 sub = client_subgraph(g, lut, c)
@@ -331,11 +361,20 @@ def main(a):
     # edges    : weight by #edges (baseline; drowns the lone attack-bearing client)
     # uniform  : equal weight per client
     # positives: weight by #malicious edges (+smoothing) so rare-signal clients aren't averaged away
+    # val_signal: privacy-preserving — weight by each client's locally-measured detection ability
+    val_sig = None
+    if a.agg_weight == "val_signal":
+        print("  computing local validation signals (privacy-preserving weighting)...")
+        val_sig = compute_val_signals(clients, a.num_clients, base_cfg)
+        print("  local val signals: " + ", ".join(f"C{c+1}={val_sig[c]:.4f}" for c in range(a.num_clients)))
+
     def agg_weight(c):
         if a.agg_weight == "uniform":
             return 1.0
         if a.agg_weight == "positives":
             return part_stats[c]["mal_edges"] + a.pos_smooth
+        if a.agg_weight == "val_signal":
+            return val_sig[c] + a.val_smooth
         return float(part_stats[c]["edges"])
     agg_w = [agg_weight(c) for c in range(a.num_clients)]
     tot_w = sum(agg_w) or 1.0
@@ -373,9 +412,11 @@ def main(a):
     print(f"\nSelected round {best_round} (val PR-AUC={best_val:.4f})")
 
     # ---- Save + report ----
-    with open("results/lanl_comparison.json", "w") as f:
+    os.makedirs(os.path.dirname(a.out_json) or ".", exist_ok=True)
+    with open(a.out_json, "w") as f:
         json.dump({"models": comparison, "trajectory": traj, "partition": a.partition,
-                   "agg_weight": a.agg_weight, "client_partition": part_stats,
+                   "agg_weight": a.agg_weight, "seed": a.seed, "pos_smooth": a.pos_smooth,
+                   "client_partition": part_stats,
                    "split": {"t_split": a.t_split, "t_test_end": a.t_test_end}}, f, indent=2)
 
     print("\n" + "=" * 64)
@@ -428,10 +469,17 @@ if __name__ == "__main__":
     p.add_argument("--val_frac", type=float, default=0.2)
     p.add_argument("--partition", choices=["host", "iid"], default="host",
                    help="host = non-IID host-community partition; iid = round-robin over snapshots")
-    p.add_argument("--agg_weight", choices=["positives", "uniform", "edges"], default="positives",
-                   help="client aggregation weighting: positives (R18 fix) / uniform / edges (baseline)")
+    p.add_argument("--agg_weight", choices=["positives", "uniform", "edges", "val_signal"],
+                   default="positives",
+                   help="client aggregation weighting: positives (R18 fix) / uniform / edges / "
+                        "val_signal (privacy-preserving local-validation signal)")
     p.add_argument("--pos_smooth", type=float, default=1.0,
                    help="smoothing added to each client's malicious-edge count for 'positives' weighting")
+    p.add_argument("--val_smooth", type=float, default=1e-3,
+                   help="smoothing added to each client's local val signal for 'val_signal' weighting")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--out_json", default="results/lanl_comparison.json",
+                   help="where to write the comparison JSON (per-run unique path for experiments)")
     p.add_argument("--server_opt", choices=["fedadam", "fedavg"], default="fedadam")
     p.add_argument("--server_lr", type=float, default=0.05)
     p.add_argument("--skip_baselines", action="store_true")
